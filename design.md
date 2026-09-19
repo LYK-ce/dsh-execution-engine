@@ -61,7 +61,7 @@ DSH 里已有两个相邻能力，本插件 ≈ **后台化的、带 `process` �
 
 程序是一段 TypeScript。函数、变量、循环、分支、字符串处理、JSON 解析、`Math`——**全都是语言自带的，都有返回值**。
 
-程序跑在**完整 Node 进程**里（见 §7.2），因此还能读写文件、发网络请求、import 模块。
+程序体在 `vm` context 里求值（§7.2），因此**它只能看见被显式注入的能力**：`flow` 命名空间、`console`、收窄的文件助手、`fetch`。没有 `import`——**程序不能 import 库或项目文件**，这是选择"能力面可枚举"付出的代价，属于明确接受的取舍。
 
 **这一条直接决定了"返回值"问题的答案：要一个值，就在程序里用 TS 算；`process` 那个位置本来就不该指望返回值。**
 
@@ -131,7 +131,13 @@ const sum = Number(readFile(resultPath))          // 到这一行，脚本一定
 flow.tmpDir: string   // 本次 run 专属；引擎创建，引擎删除
 ```
 
-理由：约定有确定落点（写进 `.d.ts`，主 agent 不用猜）；不污染会话工作目录；清理归引擎；天然"每次 run 独立"，与 §7.3 一致。
+**位置：会话工作目录下的 `.execution-engine/<runId>/`，不是 `os.tmpdir()`。**
+
+- 约定的落点确定：写进 `.d.ts`，主 agent 不用猜。
+- **必须放在工作目录内**：受管期的可写范围就是工作目录。跨 `process` 边界的取值约定（外部脚本写、程序读）要求两边都能访问同一个可写位置，而 PTC 子进程与宿主 spawn 出的受管子进程各有各的私有临时目录——**工作目录是唯一的交集**（§7.2）。
+- 清理归引擎：run 结束时整体删除，失败只记日志、不影响结果。
+- 天然"每次 run 独立"，与 §7.3 一致。
+- 代价：run 期间工作目录里会出现一个 `.execution-engine/` 目录；硬崩溃时可能残留。
 
 ## 4. 执行模型
 
@@ -254,13 +260,15 @@ DSH 的投递接口有四种形态，本设计选 followup 而非 inject：
 
 给主 agent 的接口文档就是一份**生成的 `.d.ts`**（§11），它照着写。
 
-### 7.2 完整 Node 进程
+### 7.2 执行形态、能力面与权威
 
-程序跑在**完整 Node 进程**里，**不削**——这是与 `workflow` 的关键区别。`workflow` 特意把它削成"纯协调者"（无 fs、无网络、无子进程），因为它的定位是把活交给子 agent；本插件的程序**要干确定性的活**，削了就没法干活。
+**程序体在 `vm` context 里求值**（照 `workflow-ptc` 的 `vm.createContext` + `vm.Script`）。它跑在 PTC 的完整 Node 子进程内，但**程序只能看见被显式注入的能力**：`flow` 命名空间（`process` / `processOrThrow` / `tmpDir`）、`console`、收窄的文件助手、`fetch`，以及语言内建。**没有** `process`、`require`、动态 `import`、`child_process`。
 
-安全上不构成扩大：程序是主 agent 写的，主 agent 本来就有 bash、能读写文件、能发网络请求，**同一信任级**。
+**这不是安全边界。** 实测可逃逸——`this.constructor.constructor("return process")()`，以及**任何注入函数的 `.constructor`**；加 `codeGeneration: { strings: false, wasm: false }` 也堵不住。定位与 `workflow-ptc` 一致：*withheld globals guide script authors*。**扣留是为了引导，不为堵逃逸投入。**
 
-**但封掉 `child_process` 一类的直接起进程能力**，强制所有外部执行走 `process`。理由不是安全，是**可靠性**：超时一定生效、进程树一定清干净、每一次外部执行都可观测——而单例之下，一个绕过超时的野进程可能永久锁死槽位。
+**权威来自会话**：PTC 子进程按 §5.2 快照的 `sandboxPolicy` 执行；**`process` 起的外部进程也必须过同一份策略的 `ctx.sandbox.confine`**（先例 `packages/shell/bash-sandbox`）。否则会裂开一道口子——主 agent 自己的 bash 写不了文件，而程序里的 `process` 能写任何地方，§5.2 的"权威一致"就成了空话。
+
+**外部执行一律走 `process`。** 理由不是安全，是**可靠性**：超时一定生效、进程树一定清干净、每一次外部执行都可观测——而单例之下，一个绕过超时的野进程可能永久锁死槽位。
 
 ### 7.3 每次 run 一个新进程
 
@@ -268,7 +276,7 @@ DSH 的投递接口有四种形态，本设计选 followup 而非 inject：
 
 这与现有 `ptc-runtime` 的契约一致（"no state survives between runs"），也是为了保持"每次执行都能从日志重建"这条性质。
 
-超时后杀的是**整个进程树**，不只是直接子进程——否则脚本 fork 出来的孤儿会一直跑，而单例之下你看不见它们。
+超时后**杀**的是整个进程树（`ctx.subprocess` 的终止覆盖树），但**等待**只覆盖 provider 能证明的受管范围：POSIX fallback 用进程组探活，Windows fallback **只保证直接子进程**——provider 自己的文档也承认 "descendants that escape ... are not guaranteed to terminate or delay `waitForExit()`"。所以准确的承诺是"**等 provider 能观察到的受管范围静默**"，而不是"等到整棵树都没了"。这个差别要写进已知限制。
 
 ### 7.4 复用现有能力
 

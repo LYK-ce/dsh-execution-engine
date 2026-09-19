@@ -62,14 +62,17 @@ test('name 是全小写连字符的 Loader 名，不是包名', () => {
   assert.equal(type.value, 'execution-engine')
 })
 
-test('inject 只声明阶段 0 真正用得到的服务', () => {
+test('inject 声明阶段 1 真正用得到的服务', () => {
   const declaration = declarationOf('inject')
   assert.ok(ts.isVariableDeclaration(declaration), 'inject must be a const declaration')
   const initializer = declaration.initializer
   assert.ok(initializer !== undefined && ts.isArrayLiteralExpression(initializer), 'inject must be an array literal')
   assert.deepEqual(
     initializer.elements.map(element => (ts.isStringLiteral(element) ? element.text : element.getText())),
-    ['tools'],
+    // sandboxPolicy 故意不在这里：它只在挂载的 PTC provider 确实限定时才需要，
+    // 走 ctx.get 读取（先例 packages/shell/tool-bash/src/index.ts:193）。
+    // sandbox 则必须在：process 每次都要过它的 confine。
+    ['tools', 'ptcRuntime', 'subprocess', 'sandbox', 'systemPrompt'],
   )
 })
 

@@ -1,3 +1,6 @@
+// 本目录不自足：`js-yaml` 与 `typescript` 不在本包的依赖里，靠 Node 的解析往上走到父
+// checkout 的 node_modules；`host/*.ts` 的 `@deepseek-ai/*` 也靠父仓库 tsconfig 的 paths。
+// package.json 故意不声明它们——本目录是父仓库里的 workspace，不是可独立 clone 的包。
 import assert from 'node:assert/strict'
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'

@@ -1,11 +1,16 @@
-# 阶段 1 的最小真实组合：系统提示 + 工具注册表 + Node PTC 执行缝 + 本插件的 host 半边。
+# 受限组合的 fixture：与 cordis.yml 逐行同形，只把 sandbox policy 的 mode 从
+# danger-full-access 换成 workspace-write。
+#
+# loader-driver.ts 的分支由**传进来的 fixture 解析出的 mode** 决定，不引入额外开关：
+# 这份配置走 B5，cordis.yml 走 B1–B4。两条分支互斥——受限组合下 B4 的判据（超时后哨兵
+# 文件不出现）会因为那次写入本身被策略拒绝而变成空洞判据：进程树没清干净时它也会通过。
 #
 # 相对行名以本文件所在目录为基准（Include 把 baseUrl 设成配置目录，
 # vendor/include/src/index.ts:188），所以 ../../host/index.ts 就是插件的入口。
 #
 # PTC provider 的 inject 是 ['fs', 'subprocess', 'sandbox', 'sandboxPolicy']，
 # sandboxPolicy 的 inject 是 ['sessionProjections']，所以这一串缺一个它就不会激活
-# （phase1-plan R1）。mode 取 danger-full-access：本驱动要跑真进程，不需要文件沙箱。
+# （phase1-plan R1）。mode 取 workspace-write：B5 要看的就是这层策略真的拦住了工作目录外的写。
 - id: system-prompt
   name: '@deepseek-ai/dsh-system-prompt'
 
@@ -18,7 +23,7 @@
 - id: sandbox-policy
   name: '@deepseek-ai/dsh-sandbox-policy'
   config:
-    mode: danger-full-access
+    mode: workspace-write
     # 驱动没有发起会话，cwd 走部署兜底；用仓库根，`python` 与临时目录都在预料之内。
     workspaceRoot: !!js process.cwd()
 

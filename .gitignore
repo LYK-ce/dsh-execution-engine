@@ -1,2 +1,4 @@
 node_modules/
 lib/
+# run 临时目录（design.md §3.5）：建在会话工作目录下，硬崩溃时可能残留。
+.execution-engine/
