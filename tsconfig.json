@@ -1,0 +1,34 @@
+{
+  // host 半边（host/tests）。浏览器半边是单独的 program，见 tsconfig.client.json：
+  // 两半会用不同的服务合并同一个 cordis Context 键，一个 program 里放不下两边。
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": false,
+    "incremental": false,
+    // host 由 tsx 直接跑源码，客户端 bundle 由 build/build-client.mjs 产出，所以这里只做类型检查。
+    "noEmit": true,
+    "lib": ["es2024", "dom", "dom.iterable"]
+  },
+  "include": [
+    "host/**/*.ts",
+    "tests/**/*.ts"
+  ],
+  // vendor 的源码按上游风格写，过不了本仓库的严格开关（noUncheckedIndexedAccess 等）；
+  // 仓库自己的包靠 references 引用产物绕开它，本目录照做。
+  //
+  // 比 Blackboard 多四个 vendor 引用：tests/loader-driver.ts 要 import @deepseek-ai/dsh-app-boot，
+  // 它按 paths 解析成 packages/boot/app-boot/src 后，会把 vendor 的 loader / include / group / hmr
+  // 也拉进本 program；不引用它们的产物，就会去编译它们的源码并报一屏严格开关错误。
+  //
+  // 代价：typecheck 因而依赖 vendor 产物已构建（--listFiles 里引用的全是 vendor/*/lib/types/*.d.ts）。
+  // 干净树上先跑一次仓库根的 pnpm run build，否则 typecheck 会退化成那些严格开关错误。
+  "references": [
+    { "path": "../../vendor/cordis" },
+    { "path": "../../vendor/cosmokit" },
+    { "path": "../../vendor/schemastery" },
+    { "path": "../../vendor/loader" },
+    { "path": "../../vendor/include" },
+    { "path": "../../vendor/group" },
+    { "path": "../../vendor/hmr" }
+  ]
+}

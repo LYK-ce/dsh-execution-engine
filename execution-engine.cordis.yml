@@ -1,0 +1,17 @@
+# ExecutionEngine 阶段 0 的 overlay：只插一条 host 行。
+#
+# 一条行就够：@deepseek-ai/dsh-client-modules 按**行名**解析出最近的 package.json，
+# 读它的 dsh.client 与 exports["./client"]，再把 lib/client.js 作为动态客户端 bundle
+# serve 出去。所以同一个包不需要第二条行。
+#
+# 行名写相对路径：app-boot 的 anchorInsertedPluginNames 会把它锚成本文件所在目录的
+# file:// URL，换机器、换 checkout 位置都不用改。
+#
+# 用法（源码启动的 dsh，host 半边直接跑 .ts）：
+#   pnpm dsh web --patch Workspace/ExecutionEngine/execution-engine.cordis.yml
+#
+# 前置条件：先在本目录 pnpm install && pnpm run build。@deepseek-ai/dsh-client-modules
+# 按行名读到本包的 dsh.client 后会立刻读 lib/client.js，缺了它整个 dsh web 启动失败。
+- insert:
+    - id: execution-engine-host
+      name: './host/index.ts'

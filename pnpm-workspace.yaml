@@ -1,0 +1,5 @@
+# 本目录不在仓库根的 pnpm workspace 里，自己就是一个 workspace root。
+# esbuild 的原生二进制来自 @esbuild/win32-x64 这个 optional dependency，它的 postinstall 只是自检；
+# 而这个沙箱禁止带管道的子进程，跑它会 EPERM。所以这里显式关掉构建脚本。
+allowBuilds:
+  esbuild: false

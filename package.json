@@ -1,0 +1,31 @@
+{
+  "name": "dsh-execution-engine",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  },
+  "files": [
+    "execution-engine.cordis.yml",
+    "build",
+    "client",
+    "host",
+    "lib",
+    "tests"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.client.json",
+    "build": "node build/build-client.mjs",
+    "test": "node --test --test-isolation=none \"tests/*.spec.ts\""
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  }
+}

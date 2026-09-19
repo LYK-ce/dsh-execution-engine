@@ -1,0 +1,20 @@
+{
+  // 浏览器半边单独一个 program：host 与 client 两半会用不同的服务合并同一个 cordis Context 键，
+  // 一个 program 里放不下两边——这也是仓库把 tsconfig.host.json 与 tsconfig.client.json 分开的原因。
+  //
+  // 引入 vendor/cordis 让 TS 走它的产物；client/index.ts 目前只 import type { Context }。
+  "extends": "../../tsconfig.base.client.json",
+  "compilerOptions": {
+    "composite": false,
+    "incremental": false,
+    "noEmit": true,
+    "lib": ["es2024", "dom", "dom.iterable"]
+  },
+  "include": [
+    "client/**/*.ts",
+    "client/**/*.tsx"
+  ],
+  "references": [
+    { "path": "../../vendor/cordis" }
+  ]
+}
