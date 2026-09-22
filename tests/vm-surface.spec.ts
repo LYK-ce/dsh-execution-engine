@@ -193,6 +193,51 @@ return { failures, label, syncThrow }
   }
 })
 
+/**
+ * `dispatchsubagent` 是阶段 2 加进来的洞：外壳把 `prompt` 字符串包成绑定参数转发出去，
+ * 绑定拒绝时程序看到的是拒绝（与 `processOrThrow` 同形）并拿到错误消息。真实 provider
+ * 由 loader 驱动（B6）覆盖；这里钉住的是"程序能调到它、参数与结果都过外壳"。
+ */
+test('dispatchsubagent 经外壳转发并原样交回结果', async () => {
+  const { root, tmpDir } = await makeRoots()
+  const calls: unknown[] = []
+  const namespace = Object.create(null) as Record<string, unknown>
+  Object.defineProperty(namespace, 'dispatchsubagent', {
+    enumerable: true,
+    value: (args: unknown): Promise<string> => {
+      calls.push(args)
+      const prompt = (args as { prompt: string }).prompt
+      return prompt === 'boom'
+        ? Promise.reject(new Error('child stopped with error'))
+        : Promise.resolve(`child says: ${prompt}`)
+    },
+  })
+  try {
+    const value = await runGuest({
+      tmpDir,
+      cwd: root,
+      flow: namespace,
+      program: `
+const ok = await dispatchsubagent('probe')
+let failure = 'none'
+try { await dispatchsubagent('boom') } catch (error) { failure = String(error && error.message) }
+// 接口声明写的是 Promise：参数不合法也要走拒绝，而不是同步抛出。
+let syncThrow = 'none'
+try { dispatchsubagent(42).catch(() => {}) } catch (error) { syncThrow = 'threw' }
+return { ok, failure, syncThrow }
+`,
+    })
+    assert.deepEqual(asJson(value), {
+      ok: 'child says: probe',
+      failure: 'child stopped with error',
+      syncThrow: 'none',
+    })
+    assert.deepEqual(calls, [{ prompt: 'probe' }, { prompt: 'boom' }])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 /** 文件助手限定在 run 临时目录与会话目录内；越界读写被拒，而根内以 `..` 开头的文件名不误判。 */
 test('文件助手限定在 run 临时目录与会话目录内', async () => {
   const { root, tmpDir } = await makeRoots()

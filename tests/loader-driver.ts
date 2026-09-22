@@ -1,15 +1,23 @@
 #!/usr/bin/env node
 /**
- * 阶段 1 的真实组合验证：用 app-boot 的 boot() 起一份最小 Loader 组合，断言插件与两个工具
+ * 阶段 1/2 的真实组合验证：用 app-boot 的 boot() 起一份最小 Loader 组合，断言插件与两个工具
  * 已注册、模型可见 schema 存在、`.d.ts` 系统提示段进了装配结果，并真的跑几段程序。
  *
  * 分支由传入 fixture 解析出的沙箱模式决定（见 sandboxMode），不引入额外开关：
+ *
+ * 两个组合共有：
+ * - B0 不给发起者的 `run_program` 调用大声失败——这一层判空在 `host/index.ts`，是生产上唯一
+ *   会触发它的地方（`SubagentBindingOptions.parent` 是必填，binding 里没有这一支）。
  *
  * 不受限组合（`tests/fixtures/cordis.yml`，danger-full-access）：
  * - B1 程序能跑、`process` 真的执行外部程序（`python -c 'print("EE_OK")'`）；
  * - B2 非零退出码正常返回、`processOrThrow` 抛出、超时生效且显著早于脚本自己的 30s；
  * - B3 超过 `maxTimeoutMs` 的请求在解析期被拒，且**没有启动任何进程**（哨兵文件不出现）；
- * - B4 超时后整个进程树被清干净（脚本 fork 出的子进程不会稍后写出哨兵文件）。
+ * - B4 超时后整个进程树被清干净（脚本 fork 出的子进程不会稍后写出哨兵文件）；
+ * - B6 洞与归属：`dispatchsubagent` 拿回脚本化 provider 的固定文本；provider 记到的 `parent`
+ *   逐字是发起本次调用的 agent；provider 取的是 Config 里的 `subagentProvider`；
+ *   子 agent 非正常完成时 `dispatchsubagent` 抛出，消息里带上 reason 与 provider 写的诊断。
+ *   （判据 3「子 agent 输出不进主 agent 上下文」本阶段只能间接说明，明记为未验证，阶段 4/6 补。）
  *
  * 受限组合（`tests/fixtures/cordis-confined.yml`，workspace-write）：
  * - B5 `process` 起的外部进程过发起会话的文件策略：同一个程序里，写工作目录外的路径被
@@ -17,9 +25,9 @@
  *
  * 用法（cwd = 仓库根，必须带 tsx，否则裸包名解析不到源码）：
  *   node --import tsx/esm Workspace/ExecutionEngine/tests/loader-driver.ts \
- *     Workspace/ExecutionEngine/tests/fixtures/cordis.yml              # B1–B4
+ *     Workspace/ExecutionEngine/tests/fixtures/cordis.yml              # B0–B4、B6
  *   node --import tsx/esm Workspace/ExecutionEngine/tests/loader-driver.ts \
- *     Workspace/ExecutionEngine/tests/fixtures/cordis-confined.yml     # B5
+ *     Workspace/ExecutionEngine/tests/fixtures/cordis-confined.yml     # B0、B5
  *
  * 成功判据：exit 0，stdout 末尾 `LOADER_SMOKE_OK`。
  */
@@ -28,8 +36,10 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { homedir, tmpdir } from 'node:os'
 import { join, sep } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import { boot, resolveConfigPath } from '@deepseek-ai/dsh-app-boot'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import { FAILURE_DIAGNOSTIC, FAILURE_MARKER, SCRIPTED_REPLY, scriptedStarts } from './fixtures/scripted-subagent-provider.ts'
 import * as plugin from '../host/index.ts'
 
 /** run_program 结果里返回值小节的固定前缀（host/engine.ts 的渲染）。 */
@@ -45,7 +55,7 @@ const configPath = process.argv[2]
 if (configPath === undefined) throw new Error('loader-driver requires a config path')
 
 assert.equal(plugin.name, 'execution-engine')
-assert.deepEqual(plugin.inject, ['tools', 'ptcRuntime', 'subprocess', 'sandbox', 'systemPrompt'])
+assert.deepEqual(plugin.inject, ['tools', 'ptcRuntime', 'subprocess', 'subagents', 'sandbox', 'systemPrompt'])
 assert.equal(typeof plugin.apply, 'function')
 assert.ok(!('default' in plugin), 'the plugin module must not export default (postmortem 0001)')
 
@@ -70,12 +80,16 @@ function isInside(root: string, path: string): boolean {
 /**
  * 调一次 run_program，返回模型可见文本。程序自己失败不是工具失败：结果文本里带
  * `程序执行失败（` 小节，而工具结果本身仍是成功的。
+ *
+ * `agent` 必须给：阶段 2 起 `run_program` 要求归属明确（design.md §5.1），
+ * 没有发起者的调用会大声失败——真实链路里这个字段由 agent loop 填。
  */
 async function callRunProgram(code: string): Promise<string> {
   const result = await ctx.tools.execute({
     signal: new AbortController().signal,
     callId: ToolCallId(`execution-engine-run-${String(++callSeq)}`),
     name: 'run_program',
+    agent: initiator,
     arguments: { code },
   })
   const text = result.content.filter(block => block.type === 'text').map(block => block.text).join('')
@@ -84,6 +98,25 @@ async function callRunProgram(code: string): Promise<string> {
   // 渲染只有一处（host/engine.ts），模型看到的文本必须就是那个值。
   assert.equal(text, value.output, 'the rendered content must be the canonical output value')
   return value.output
+}
+
+/**
+ * 调一次 `run_program` 但**不给发起者**，返回工具结果文本。
+ *
+ * 与 `callRunProgram` 不同，这里不做 `isError` 断言：这一条要看的正是那句失败文本本身。
+ * 两个 fixture 都挂了 sandboxPolicy，所以 `authorityOf` 能先解析出工作目录，
+ * 走到的是"没有发起者"那一句，而不是它上面那句 cwd 缺失。
+ * @param code - 程序源码。
+ * @returns 工具结果里的文本。
+ */
+async function callRunProgramWithoutAgent(code: string): Promise<string> {
+  const result = await ctx.tools.execute({
+    signal: new AbortController().signal,
+    callId: ToolCallId(`execution-engine-no-agent-${String(++callSeq)}`),
+    name: 'run_program',
+    arguments: { code },
+  })
+  return result.content.filter(block => block.type === 'text').map(block => block.text).join('')
 }
 
 /** 程序失败只体现在文本里（工具结果不带 isError 字段）。 */
@@ -105,6 +138,16 @@ function returned(output: string): unknown {
 const policyService = ctx.get('sandboxPolicy')
 assert.ok(policyService !== undefined, 'the fixture must mount sandboxPolicy')
 const sandboxMode = policyService.resolve().mode
+
+/**
+ * 发起本次 run 的主 agent（design.md §5.1）：阶段 2 起 `run_program` 要求归属明确，驱动得像
+ * 真实链路一样给一个发起者。形态照 `packages/workflow/workflow-ptc/tests/setup.ts` 的 `fakeParent`：
+ * 真 Session（cwd 取部署兜底，与阶段 1 无发起者时的解析结果一致）+ 最小 Agent 面。
+ */
+const sessions = ctx.get('sessions')
+assert.ok(sessions !== undefined, 'the fixture must mount the session store')
+const initiatorSession = sessions.create(undefined, { meta: { cwd: policyService.resolve().workspaceRoot } })
+const initiator = { id: initiatorSession.id, session: initiatorSession, options: {} } as unknown as Agent
 
 try {
   assert.ok(
@@ -131,9 +174,20 @@ try {
   const sdk = assembly.sections.find(section => section.name === 'execution-engine-sdk')
   assert.ok(sdk !== undefined, 'the execution-engine-sdk prompt section is not registered')
   assert.equal(sdk.interpolate, false, 'the SDK text must not be interpolated')
-  for (const declaration of ['declare function process(', 'declare function processOrThrow(', 'flow.tmpDir', 'declare const console']) {
+  for (const declaration of ['declare function dispatchsubagent(', 'declare function process(', 'declare function processOrThrow(', 'flow.tmpDir', 'declare const console']) {
     assert.ok(sdk.text.includes(declaration), `the SDK section must declare ${declaration}`)
   }
+
+  // ---- B0：没有发起者的调用大声失败（两个组合共有） ---------------------------
+  // `ToolRunContext.agent` 是可选字段，所以 `host/index.ts` 自己判空；它是生产上唯一会触发那句
+  // 错误的地方（binding 的 `parent` 是必填，缺席在类型层不可表达），只有真装配跑得出来。
+  const noAgent = await callRunProgramWithoutAgent('return 1')
+  assert.match(
+    noAgent,
+    /requires an initiating agent/,
+    `a run_program call without an initiating agent must fail loud:\n${noAgent}`,
+  )
+  process.stdout.write('B0 run_program without an initiating agent fails loud: OK\n')
 
   if (sandboxMode === 'danger-full-access') {
     // ---- B1：程序能跑，process 真的执行外部程序 -------------------------------
@@ -238,6 +292,56 @@ return { timedOut: r.timedOut }
       'B4: the forked descendant survived the timeout — the managed range was not cleared',
     )
     process.stdout.write('B4 process tree cleared after timeout: OK\n')
+
+    // ---- B6：洞与归属 ---------------------------------------------------------
+    // 判据 1 + 4：程序里两次 `dispatchsubagent` 各拿回脚本化 provider 的固定文本，而该 provider
+    // 之所以被调用，是因为 fixture 把 `subagentProvider` 配成了 `scripted`——配错成没注册的名字时
+    // `ctx.subagents.start` 会直接拒绝，这段程序会以失败小节收场，下面第一条断言就会拦住。
+    const b6 = await callRunProgram(`
+const first = await dispatchsubagent('scripted one')
+const second = await dispatchsubagent('scripted two')
+return { first, second }
+`)
+    assertProgramSucceeded(b6, 'B6')
+    assert.deepEqual(returned(b6), { first: SCRIPTED_REPLY, second: SCRIPTED_REPLY })
+
+    // 判据 2：归属用 SessionId 逐字比对，不是"非空"这种弱断言。
+    const recorded = scriptedStarts()
+    assert.equal(
+      recorded.length,
+      2,
+      'the scripted provider recorded no start — the fixture and the driver resolved different module instances, '
+      + 'or the configured provider was not the scripted one',
+    )
+    assert.deepEqual(
+      recorded.map(entry => entry.parentId),
+      [initiator.id, initiator.id],
+      'every child must be attributed to the agent that initiated this run_program call',
+    )
+    assert.deepEqual(recorded.map(entry => entry.prompt), ['scripted one', 'scripted two'])
+    process.stdout.write('B6 dispatchsubagent text and ownership: OK\n')
+
+    // 判据 5：子 agent 非正常完成时抛出，且消息里带上 reason 与 provider 写的诊断
+    // （phase2-plan §9 Q1；诊断是有意的信息通道，见 packages/subagent/subagent/src/types.ts:288-294）。
+    const b6Failure = await callRunProgram(`
+try {
+  await dispatchsubagent(${JSON.stringify(`${FAILURE_MARKER} this one must fail`)})
+  return { threw: false }
+} catch (error) {
+  return { threw: true, message: String(error && error.message) }
+}
+`)
+    assertProgramSucceeded(b6Failure, 'B6-failure')
+    const failedChild = returned(b6Failure) as { threw: boolean; message?: string }
+    assert.equal(failedChild.threw, true, 'a non-completed child must make dispatchsubagent throw')
+    const failureMessage = String(failedChild.message)
+    assert.match(failureMessage, /error/)
+    assert.ok(
+      failureMessage.includes(FAILURE_DIAGNOSTIC),
+      `the failure message must carry the provider diagnostic:\n${failureMessage}`,
+    )
+    assert.equal(scriptedStarts().length, 3, 'the failing dispatch must still have reached the provider')
+    process.stdout.write('B6 non-completed child throws with its reason and diagnostic: OK\n')
   } else {
     // ---- B5：受限组合——工作目录外的写被策略拒绝，工作目录内的写成功 -----------
     // 两条用例在同一个程序、同一个 `process` 绑定、同一份策略下跑同一段 python 脚本，

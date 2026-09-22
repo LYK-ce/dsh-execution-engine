@@ -1,21 +1,25 @@
-# 受限组合的 fixture：与 cordis.yml 逐行同形，只把 sandbox policy 的 mode 从
-# danger-full-access 换成 workspace-write。
+# 受限组合的 fixture：服务表与 cordis.yml 相同，只把 sandbox policy 的 mode 从
+# danger-full-access 换成 workspace-write，并且不挂 B5 用不到的脚本化子 agent provider。
 #
 # loader-driver.ts 的分支由**传进来的 fixture 解析出的 mode** 决定，不引入额外开关：
-# 这份配置走 B5，cordis.yml 走 B1–B4。两条分支互斥——受限组合下 B4 的判据（超时后哨兵
+# 这份配置走 B0 与 B5，cordis.yml 走 B0–B4 与 B6。两条分支互斥——受限组合下 B4 的判据（超时后哨兵
 # 文件不出现）会因为那次写入本身被策略拒绝而变成空洞判据：进程树没清干净时它也会通过。
 #
 # 相对行名以本文件所在目录为基准（Include 把 baseUrl 设成配置目录，
 # vendor/include/src/index.ts:188），所以 ../../host/index.ts 就是插件的入口。
 #
 # PTC provider 的 inject 是 ['fs', 'subprocess', 'sandbox', 'sandboxPolicy']，
-# sandboxPolicy 的 inject 是 ['sessionProjections']，所以这一串缺一个它就不会激活
-# （phase1-plan R1）。mode 取 workspace-write：B5 要看的就是这层策略真的拦住了工作目录外的写。
+# sandboxPolicy 的 inject 是 ['sessionProjections']，子 agent 服务的 host 半边还需要
+# 本插件的 inject 里有 'subagents'，所以这一串缺一个它就不会激活（phase1-plan R1、phase2-plan R4）。
+# mode 取 workspace-write：B5 要看的就是这层策略真的拦住了工作目录外的写。
 - id: system-prompt
   name: '@deepseek-ai/dsh-system-prompt'
 
 - id: tools
   name: '@deepseek-ai/dsh-tools'
+
+- id: sessions
+  name: '@deepseek-ai/dsh-session'
 
 - id: session-projection
   name: '@deepseek-ai/dsh-session-projection'
@@ -41,6 +45,11 @@
   config:
     # 超时用例只给 1s，终止阶梯要快，否则"耗时显著小于 30s"这条判据会变钝。
     graceMs: 500
+
+# 本插件的 inject 里有 'subagents'，缺了它整个插件不会激活；B5 不派子 agent，所以这里不注册
+# provider，也不需要 subagentProvider 配置（那是 cordis.yml 的 B6 才用到的）。
+- id: subagents
+  name: '@deepseek-ai/dsh-subagent'
 
 - id: execution-engine-host
   name: '../../host/index.ts'

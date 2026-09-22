@@ -4,9 +4,11 @@ import { resolve } from 'node:path'
 import { test } from 'node:test'
 import {
   DEFAULT_PROCESS_TIMEOUT_MS,
+  DEFAULT_SUBAGENT_PROVIDER,
   MAX_PROCESS_TIMEOUT_MS,
   resolveProcessTimeouts,
   resolveRequestedTimeout,
+  resolveSubagentProvider,
 } from '../host/config.ts'
 
 /** 项目根：本 spec 位于 tests/ 下。 */
@@ -72,5 +74,31 @@ test('schemastery 模式的缺省与解析器共用同一份常量', () => {
   assert.ok(
     source.includes('z.natural().default(MAX_PROCESS_TIMEOUT_MS)'),
     'the schema must default process.maxTimeoutMs from MAX_PROCESS_TIMEOUT_MS',
+  )
+  assert.ok(
+    source.includes('z.string().min(1).default(DEFAULT_SUBAGENT_PROVIDER)'),
+    'the schema must reject the empty provider name and default from DEFAULT_SUBAGENT_PROVIDER',
+  )
+})
+
+/** provider 名默认就是 `spawn`（`subagent-spawn-in-process` 注册的那个），部署可覆盖。 */
+test('subagentProvider 缺省 spawn，可覆盖', () => {
+  assert.equal(DEFAULT_SUBAGENT_PROVIDER, 'spawn')
+  assert.equal(resolveSubagentProvider({}), 'spawn')
+  assert.equal(resolveSubagentProvider({ subagentProvider: 'scripted' }), 'scripted')
+})
+
+/**
+ * 空名字与带首尾空白的名字都是装配错误：静默回落会把子 agent 挂到部署没选的后端上，
+ * 带空白的名字在 `ctx.subagents` 里也永远匹配不到 provider（先例
+ * packages/workflow/workflow-ptc/src/index.ts:69）。
+ */
+test('subagentProvider 空名字与未规范化名字被拒', () => {
+  assert.throws(() => resolveSubagentProvider({ subagentProvider: '' }), /non-empty provider name/)
+  assert.throws(() => resolveSubagentProvider({ subagentProvider: '   ' }), /non-empty provider name/)
+  assert.throws(() => resolveSubagentProvider({ subagentProvider: ' scripted ' }), /non-empty provider name/)
+  assert.throws(
+    () => resolveSubagentProvider({ subagentProvider: 42 as unknown as string }),
+    /non-empty provider name/,
   )
 })

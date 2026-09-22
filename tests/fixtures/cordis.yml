@@ -1,16 +1,21 @@
 # 阶段 1 的最小真实组合：系统提示 + 工具注册表 + Node PTC 执行缝 + 本插件的 host 半边。
+# 阶段 2 追加：会话存储（驱动要一个真实的发起 agent）、子 agent 服务与脚本化 provider。
 #
 # 相对行名以本文件所在目录为基准（Include 把 baseUrl 设成配置目录，
 # vendor/include/src/index.ts:188），所以 ../../host/index.ts 就是插件的入口。
 #
 # PTC provider 的 inject 是 ['fs', 'subprocess', 'sandbox', 'sandboxPolicy']，
-# sandboxPolicy 的 inject 是 ['sessionProjections']，所以这一串缺一个它就不会激活
-# （phase1-plan R1）。mode 取 danger-full-access：本驱动要跑真进程，不需要文件沙箱。
+# sandboxPolicy 的 inject 是 ['sessionProjections']，子 agent 服务的 host 半边还需要
+# 本插件的 inject 里有 'subagents'，所以这一串缺一个它就不会激活（phase1-plan R1、phase2-plan R4）。
+# mode 取 danger-full-access：本驱动要跑真进程，不需要文件沙箱。
 - id: system-prompt
   name: '@deepseek-ai/dsh-system-prompt'
 
 - id: tools
   name: '@deepseek-ai/dsh-tools'
+
+- id: sessions
+  name: '@deepseek-ai/dsh-session'
 
 - id: session-projection
   name: '@deepseek-ai/dsh-session-projection'
@@ -37,5 +42,15 @@
     # 超时用例只给 1s，终止阶梯要快，否则"耗时显著小于 30s"这条判据会变钝。
     graceMs: 500
 
+- id: subagents
+  name: '@deepseek-ai/dsh-subagent'
+
+# 替掉需要模型 route 的 `spawn`：keyless 的确定性 provider（phase2-plan §5）。
+- id: scripted-subagent
+  name: './scripted-subagent-provider.ts'
+
 - id: execution-engine-host
   name: '../../host/index.ts'
+  config:
+    # B6 要证明 provider 取的是 Config 里的值，而不是写死在引擎里的默认名。
+    subagentProvider: scripted

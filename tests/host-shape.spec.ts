@@ -62,7 +62,7 @@ test('name 是全小写连字符的 Loader 名，不是包名', () => {
   assert.equal(type.value, 'execution-engine')
 })
 
-test('inject 声明阶段 1 真正用得到的服务', () => {
+test('inject 声明阶段 2 真正用得到的服务', () => {
   const declaration = declarationOf('inject')
   assert.ok(ts.isVariableDeclaration(declaration), 'inject must be a const declaration')
   const initializer = declaration.initializer
@@ -72,7 +72,8 @@ test('inject 声明阶段 1 真正用得到的服务', () => {
     // sandboxPolicy 故意不在这里：它只在挂载的 PTC provider 确实限定时才需要，
     // 走 ctx.get 读取（先例 packages/shell/tool-bash/src/index.ts:193）。
     // sandbox 则必须在：process 每次都要过它的 confine。
-    ['tools', 'ptcRuntime', 'subprocess', 'sandbox', 'systemPrompt'],
+    // subagents 也必须在：dispatchsubagent 的归属就是它唯一的落点（design.md §5.1）。
+    ['tools', 'ptcRuntime', 'subprocess', 'subagents', 'sandbox', 'systemPrompt'],
   )
 })
 

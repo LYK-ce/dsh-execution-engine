@@ -1,9 +1,8 @@
 /**
  * 给主 agent 的接口文档（design.md §11；phase1-plan §9）。
  *
- * 这份文本进系统提示，就是主 agent 写程序时唯一的 API 依据。它按 phase1-plan §3.3
- * 方案乙列出的能力面增删：只描述本阶段已经存在的原语——`dispatchsubagent` 与 `report`
- * 属于阶段 2 / 阶段 4，这里不出现。
+ * 这份文本进系统提示，就是主 agent 写程序时唯一的 API 依据。它按阶段列出能力面增删：
+ * 这里只描述已经存在的原语——`dispatchsubagent` 属于阶段 2，`report` 属于阶段 4。
  *
  * 超时那两个数是部署可配的（design.md §9），所以正文由**已解析的**策略生成：写死数字
  * 会让部署改了 Config 之后，模型看到的是一份假文档。
@@ -38,6 +37,12 @@ declare const flow: {
   /** 本次 run 专属的临时目录；引擎创建，run 结束时整体删除。 */
   readonly tmpDir: string
 }
+
+/**
+ * 派一个子 agent 执行一段工作，返回它的最终文本。prompt 是程序里的字面量。
+ * 正常完成但没有文本块时是空串——那是"子 agent 没产出文本"，不是"答案被丢了"。
+ */
+declare function dispatchsubagent(prompt: string): Promise<string>
 
 /** 执行一个外部程序。非零退出码与超时都正常返回，由程序自己判断。 */
 declare function process(argv: string[], opts?: ProcessOptions): Promise<ProcessResult>
@@ -97,5 +102,9 @@ const sum = Number(await readTextFile(flow.tmpDir + '/result.txt'))   // 到这�
 \`\`\`
 
 先用 \`processOrThrow\` 确认成功再读文件，否则会读到不存在的或写了一半的文件。
+
+\`dispatchsubagent\` 的失败也是异常：子 agent 没有正常完成时它抛出，消息里带结束的类别
+（\`error\` / \`refusal\` / \`max-tokens\` 一类），以及 provider 写的诊断与结束前已产生的部分输出。
+要用它的返回值就必须自己 \`try/catch\`——静默拿到一段可能是错误描述的文字，会让失败伪装成成功。
 `
 }

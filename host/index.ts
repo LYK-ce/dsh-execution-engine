@@ -1,8 +1,8 @@
 /**
  * ExecutionEngine 的 host 半边：注册 `run_program` 与它的 `.d.ts` 系统提示段。
  *
- * 阶段 1 的边界（phase1-plan §7）：`run_program` 是**前台阻塞**调用，没有后台 job、
- * 没有单例、没有取消工具、没有 `report`、没有 `dispatchsubagent`、没有 UI。
+ * 阶段 2 的边界（phase2-plan §0）：洞接上了 `ctx.subagents`，归属是发起的主 agent（design.md §5.1）。
+ * 仍然没有后台 job、没有单例、没有取消工具、没有 `report`、没有 UI。
  * @module dsh-execution-engine
  */
 
@@ -15,8 +15,10 @@ import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import {
   DEFAULT_PROCESS_TIMEOUT_MS,
+  DEFAULT_SUBAGENT_PROVIDER,
   MAX_PROCESS_TIMEOUT_MS,
   resolveProcessTimeouts,
+  resolveSubagentProvider,
 } from './config.ts'
 import type { Config as ExecutionEngineConfig, ProcessConfig } from './config.ts'
 import { runProgram } from './engine.ts'
@@ -38,17 +40,19 @@ const ProcessConfigSchema: z<ProcessConfig> = z.object({
 
 export const Config: z<ExecutionEngineConfig> = z.object({
   process: ProcessConfigSchema.default({}),
+  // `min(1)` 挡空串；纯空白名是 `resolveSubagentProvider` 的 trim 检查挡的（见 host/config.ts）。
+  subagentProvider: z.string().min(1).default(DEFAULT_SUBAGENT_PROVIDER),
 })
 
 export const name = 'execution-engine'
 
 /**
- * 阶段 1 真正用得到的服务：工具注册表、PTC 执行缝、子进程执行缝、进程沙箱、系统提示。
- * `sandbox` 与 `sandboxPolicy` 不同：`process` 起的外部进程要先过 `ctx.sandbox.confine`
+ * 阶段 2 真正用得到的服务：工具注册表、PTC 执行缝、子进程执行缝、子 agent 执行缝、进程沙箱、
+ * 系统提示。`sandbox` 与 `sandboxPolicy` 不同：`process` 起的外部进程要先过 `ctx.sandbox.confine`
  * （`danger-full-access` 是显式的不受限模式），所以 `sandbox` 进 `inject`
  * （先例 packages/shell/bash-sandbox/src/index.ts:46）。
  */
-export const inject = ['tools', 'ptcRuntime', 'subprocess', 'sandbox', 'systemPrompt']
+export const inject = ['tools', 'ptcRuntime', 'subprocess', 'subagents', 'sandbox', 'systemPrompt']
 
 /** 一次工具调用要用的权威：从发起会话现场快照，不固化在引擎上（design.md §5.2）。 */
 interface RunAuthority {
@@ -69,6 +73,7 @@ interface RunAuthority {
  */
 export function apply(ctx: Context, config: Config): void {
   const timeouts = resolveProcessTimeouts(config)
+  const subagentProvider = resolveSubagentProvider(config)
 
   const sandboxPolicy: SandboxPolicyService | undefined =
     ctx.ptcRuntime.sandboxMode === undefined ? undefined : ctx.get('sandboxPolicy')
@@ -92,17 +97,26 @@ export function apply(ctx: Context, config: Config): void {
   ctx.tools.register(createSkeletonTool())
   ctx.tools.register(createRunProgramTool(async (args, exec) => {
     const authority = authorityOf(exec)
+    // 归属的落点在这里，也只有这里：`ToolRunContext.agent` 是可选字段，缺席时**大声失败**
+    // ——静默换一个 parent 会直接破坏 design.md §5.1 的归属承诺。
+    const parent = exec.agent
+    if (parent === undefined) {
+      throw new Error('execution-engine: run_program requires an initiating agent to attribute subagents to')
+    }
     return await runProgram(
       {
         ptcRuntime: ctx.ptcRuntime,
         subprocess: ctx.subprocess,
+        subagents: ctx.subagents,
         sandbox: ctx.sandbox,
         timeouts,
+        subagentProvider,
         warn: (message) => { ctx.logger.warn(message) },
       },
       {
         code: args.code,
         cwd: authority.cwd,
+        parent,
         signal: exec.signal,
         ...authority.sandboxPolicy === undefined ? {} : { sandboxPolicy: authority.sandboxPolicy },
       },

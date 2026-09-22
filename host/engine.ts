@@ -1,19 +1,22 @@
 /**
  * 把一段程序交给 `ctx.ptcRuntime` 执行（phase1-plan §2）。
  *
- * 引擎负责三件事：组装程序正文（外壳 + 用户源码）、把 `process` / `processOrThrow` 作为
- * `flow` 绑定命名空间挂上、把 PTC 的结果渲染成模型可读文本。程序失败**不是**异常——它
- * 是结果里的一个字段（design.md §3.3 的同一条理由）。
+ * 引擎负责三件事：组装程序正文（外壳 + 用户源码）、把 `dispatchsubagent` 与
+ * `process` / `processOrThrow` 作为 `flow` 绑定命名空间挂上、把 PTC 的结果渲染成模型可读文本。
+ * 程序失败**不是**异常——它是结果里的一个字段（design.md §3.3 的同一条理由）。
  * @module dsh-execution-engine/engine
  */
 
 import { randomUUID } from 'node:crypto'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { PtcJsonValue, PtcRunResult, PtcRuntime } from '@deepseek-ai/dsh-ptc-runtime'
 import type { SandboxExecutionPolicy, SandboxProvider } from '@deepseek-ai/dsh-sandbox'
+import type { SubagentRuntime } from '@deepseek-ai/dsh-subagent'
 import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import { guestSource } from './capabilities.ts'
 import type { ProcessTimeouts } from './config.ts'
 import { createProcessBindings } from './process-binding.ts'
+import { createSubagentBindings } from './subagent-binding.ts'
 import { createRunTmpDir, removeRunTmpDir } from './tmp-dir.ts'
 
 /** 一次 `run_program` 的执行请求：程序正文加上发起会话现场快照下来的权威。 */
@@ -22,6 +25,8 @@ export interface RunProgramRequest {
   readonly code: string
   /** 本次执行的工作目录。 */
   readonly cwd: string
+  /** 发起本次 run 的主 agent；每个 `dispatchsubagent` 派出的子 agent 都挂在它下面（design.md §5.1）。 */
+  readonly parent: Agent
   /** provider 支持限定时一并快照的文件策略；不支持时不传。 */
   readonly sandboxPolicy?: SandboxExecutionPolicy
   /** 本次调用的取消信号；abort 会终止程序与其在飞的子进程。 */
@@ -34,10 +39,14 @@ export interface RunProgramDeps {
   readonly ptcRuntime: PtcRuntime
   /** 外部程序的执行缝。 */
   readonly subprocess: SubprocessRuntime
+  /** 派子 agent 的执行缝。 */
+  readonly subagents: SubagentRuntime
   /** 把 `process` 的 argv 包成受限执行形态的 provider。 */
   readonly sandbox: SandboxProvider
   /** 部署已解析的超时策略。 */
   readonly timeouts: ProcessTimeouts
+  /** 部署配置里的子 agent provider 名。 */
+  readonly subagentProvider: string
   /** 清理失败一类非致命问题的告警出口。 */
   readonly warn: (message: string) => void
 }
@@ -53,8 +62,8 @@ export interface RunProgramOutcome {
  *
  * 整段程序没有截止时间（`timeoutMs: null`）：它天然长跑，加整体截止会误杀正常任务
  * （design.md §9）。单次 `process` 的超时由 `process-binding.ts` 负责。
- * @param deps - PTC / subprocess / sandbox 执行缝与部署的超时策略。
- * @param request - 程序正文、cwd、可选的已解析文件策略、取消信号。
+ * @param deps - PTC / subprocess / subagents / sandbox 执行缝与部署的策略。
+ * @param request - 程序正文、cwd、发起者、可选的已解析文件策略、取消信号。
  * @returns 渲染好的模型可见结果。
  */
 export async function runProgram(deps: RunProgramDeps, request: RunProgramRequest): Promise<RunProgramOutcome> {
@@ -65,14 +74,23 @@ export async function runProgram(deps: RunProgramDeps, request: RunProgramReques
       program,
       bindings: [{
         global: 'flow',
-        functions: createProcessBindings({
-          subprocess: deps.subprocess,
-          sandbox: deps.sandbox,
-          cwd: request.cwd,
-          ...request.sandboxPolicy === undefined ? {} : { sandboxPolicy: request.sandboxPolicy },
-          signal: request.signal,
-          timeouts: deps.timeouts,
-        }),
+        functions: {
+          ...createProcessBindings({
+            subprocess: deps.subprocess,
+            sandbox: deps.sandbox,
+            cwd: request.cwd,
+            ...request.sandboxPolicy === undefined ? {} : { sandboxPolicy: request.sandboxPolicy },
+            signal: request.signal,
+            timeouts: deps.timeouts,
+          }),
+          ...createSubagentBindings({
+            parent: request.parent,
+            provider: deps.subagentProvider,
+            signal: request.signal,
+            subagents: deps.subagents,
+            warn: deps.warn,
+          }),
+        },
       }],
       cwd: request.cwd,
       timeoutMs: null,
