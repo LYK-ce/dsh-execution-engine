@@ -60,6 +60,23 @@
 - id: jobs
   name: '@deepseek-ai/dsh-jobs-local'
 
+# 阶段 6 追加：**不是为了本插件激活**——面板的两条路由走可选注入，没有 connection 时引擎照样
+# 能跑程序（headless 部署就是这种）。加这两行是为了让 **B14** 在组合里拿到真实的 connection，
+# 从而从 `ctx.connection.fetch` 上验两条面板路由真的挂上了。connection 自己的 inject 是
+# ['credentials']，所以这一串缺一个，B14 就拿不到服务。
+#
+# credentials-local 要一个持久化凭据文档：默认落在 harness home（与 dsh web 同一份，即
+# `$DSH_HOME/.credentials.yaml` 或 `~/.dsh/.credentials.yaml`）。connection 在那里取/建浏览器
+# 会话密钥——这正是 dsh web 每次启动做的事。**不想让它碰真实 home 时，给驱动一个临时 DSH_HOME**：
+#   $env:DSH_HOME = <临时目录>; node --import tsx/esm ...
+- id: credentials
+  name: '@deepseek-ai/dsh-credentials-local'
+  config:
+    watch: false
+
+- id: client-connection
+  name: '@deepseek-ai/dsh-client-connection'
+
 - id: execution-engine-host
   name: '../../host/index.ts'
   config:

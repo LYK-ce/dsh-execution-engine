@@ -75,6 +75,11 @@ test('inject 声明阶段 3 真正用得到的服务', () => {
     // subagents 也必须在：dispatchsubagent 的归属就是它唯一的落点（design.md §5.1）。
     // jobs 是阶段 3 的后台化落点：run_program 注册 job、cancel_program 取消它
     // （design.md §4.1）；controller 也由本插件自己挂，所以这一项缺了整个插件不会激活。
+    // connection 与 agents 都不在这里，两者都走可选路径：
+    // - connection：面板的两条路由改在 `ctx.inject(['connection'], …)` 里注册，所以没有 web 传输的
+    //   headless 部署照样能跑程序——引擎本体不该被客户端特性绑架。
+    // - agents：sessionId → 发起 agent 的反向查找走 `ctx.get('agents')`，缺席时取消幂等地回
+    //   "没有在跑的程序"。
     ['tools', 'jobs', 'ptcRuntime', 'subprocess', 'subagents', 'sandbox', 'systemPrompt'],
   )
 })

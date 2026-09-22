@@ -1,19 +1,25 @@
 /**
  * ExecutionEngine 的 host 半边：把 `run_program` 变成后台 job，加上 `cancel_program`，
- * 挂上 job controller，并注册它的 `.d.ts` 系统提示段。
+ * 挂上 job controller，注册它的 `.d.ts` 系统提示段，并把面板要的两条 fetch route 挂上。
  *
- * 阶段 4 的边界：有 `report`（程序单向汇报回发起会话）、有 `flow/*` observe-only 事件。
- * 仍然没有 UI——`flow/*` 的消费者在阶段 6。
+ * 阶段 6 的边界：`flow/*` 事件有了第一个真实消费者——`host/flow-state.ts` 的累加器，
+ * 浏览器经 `ctx.connection.fetch` 上的两条 exact route 读它（见该模块头：面板因此**不可回放**）。
  * @module dsh-execution-engine
  */
 
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+// 仅类型：`ctx.get('agents')` 的反向查找（sessionId → 发起 agent）要它的服务声明。
+import type {} from '@deepseek-ai/dsh-agent'
+// 仅类型：面板的两条路由挂在 `ctx.connection.fetch` 上，它的服务声明与路由契约都在这里。
+import type {} from '@deepseek-ai/dsh-client-connection'
+import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxPolicyService } from '@deepseek-ai/dsh-sandbox-policy'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 // 仅类型：解析 `ctx.systemPrompt` 与 `ctx.jobs` 的服务声明。
 import type {} from '@deepseek-ai/dsh-system-prompt'
+import { CANCEL_PATH, STATE_PATH } from '../shared/protocol.ts'
 import {
   DEFAULT_PROCESS_TIMEOUT_MS,
   DEFAULT_SUBAGENT_PROVIDER,
@@ -23,7 +29,12 @@ import {
 } from './config.ts'
 import type { Config as ExecutionEngineConfig, ProcessConfig } from './config.ts'
 import { runProgram } from './engine.ts'
+import { FlowState } from './flow-state.ts'
+// 仅类型：`ctx.on('flow/*')` 的事件声明由它合并进来。
+import type {} from './flow-events.ts'
 import { createProgramJobs } from './job-runner.ts'
+import type { ProgramCancel } from './job-runner.ts'
+import { handleCancel, handleState } from './routes.ts'
 import { SDK_SECTION_NAME, sdkText } from './sdk.ts'
 import { createCancelProgramTool, createRunProgramTool } from './tool.ts'
 
@@ -49,10 +60,16 @@ export const Config: z<ExecutionEngineConfig> = z.object({
 export const name = 'execution-engine'
 
 /**
- * 阶段 3 真正用得到的服务：工具注册表、后台 job 注册表、PTC 执行缝、子进程执行缝、子 agent 执行缝、
+ * 真正用得到的服务：工具注册表、后台 job 注册表、PTC 执行缝、子进程执行缝、子 agent 执行缝、
  * 进程沙箱、系统提示。`sandbox` 与 `sandboxPolicy` 不同：`process` 起的外部进程要先过
  * `ctx.sandbox.confine`（`danger-full-access` 是显式的不受限模式），所以 `sandbox` 进 `inject`
  * （先例 packages/shell/bash-sandbox/src/index.ts:46）。
+ *
+ * **`connection` 故意不在这里。** 面板的两条路由确实需要 HTTP 传输，但**引擎本体不需要**——
+ * headless 部署照样要能跑程序。放进 `inject` 会让"没有 web 传输"变成"连 `run_program` 都不注册"，
+ * 那是拿客户端特性绑架引擎本体。改成可选注入：传输在场时才注册路由
+ * （先例 `packages/client/connection/src/index.ts:119`、`packages/api/gateway/src/index.ts:198`）。
+ * 代价是"面板没出现"不再被响亮地报出来——这是有意的取舍，design.md §8.2 把面板列为第二批交付物。
  */
 export const inject = ['tools', 'jobs', 'ptcRuntime', 'subprocess', 'subagents', 'sandbox', 'systemPrompt']
 
@@ -142,6 +159,45 @@ export function apply(ctx: Context, config: Config): void {
     })
   }))
   ctx.tools.register(createCancelProgramTool(exec => programs.cancel(ownerOf(exec, 'cancel_program'))))
+
+  // 面板的观察面：`flow/*` 的宿主侧累加器 + 两条 exact Fetch route（phase6-plan §2）。
+  //
+  // 累加器与监听都挂在插件 fiber 上，所以插件 unload 时它们一起走；路由也走 `ctx.effect`，
+  // 与 Blackboard 同一个形态（`ctx.connection.fetch.register` 返回异步 disposer）。
+  const flow = new FlowState()
+  ctx.on('flow/start', info => { flow.start(info) })
+  ctx.on('flow/call-start', info => { flow.callStart(info) })
+  ctx.on('flow/call-end', info => { flow.callEnd(info) })
+  ctx.on('flow/report', info => { flow.report(info) })
+  ctx.on('flow/end', info => { flow.end(info) })
+
+  // `sessionId` → 发起 agent 的反向查找只有 agents 注册表能做，所以它**不在** `inject` 里、
+  // 走 `ctx.get` 读（先例同文件上的 `sandboxPolicy`）：`run_program` 的 owner 由工具调用现场给，
+  // 引擎本身不需要这个注册表。它缺席时"没有在跑的程序"就是事实本身——那正是 `cancel_program`
+  // 的幂等语义（design.md §4.4），不编一个错误出来。
+  const cancelBySession = async (sessionId: SessionId): Promise<ProgramCancel> => {
+    const owner = ctx.get('agents')?.get(sessionId)
+    if (owner === undefined) return { cancelled: false }
+    return await programs.cancel(owner)
+  }
+
+  // 传输在场时才注册路由。引擎本体不依赖 HTTP，所以 `connection` 走可选注入而不是 `inject`
+  // （理由见上面 `inject` 的 JSDoc）；这里的两条路由与 `flow/*` 的累加器都不会因为传输缺席而
+  // 影响 `run_program` / `cancel_program`。
+  ctx.inject(['connection'], (routeCtx) => {
+    routeCtx.effect(() => routeCtx.connection.fetch.register({
+      path: STATE_PATH,
+      methods: ['GET'],
+      requestBody: 'buffered',
+      fetch: request => handleState(flow, request),
+    }), 'execution-engine: state route')
+    routeCtx.effect(() => routeCtx.connection.fetch.register({
+      path: CANCEL_PATH,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: request => handleCancel(cancelBySession, request),
+    }), 'execution-engine: cancel route')
+  })
 
   // section() 返回的就是挂在调用方 fiber 上的 effect disposer；这里照 phase1-plan §9
   // 用 ctx.effect 再持有一次，并带上 label（先例 packages/preset/persona/src/index.ts:63,68）。

@@ -2,7 +2,10 @@
   // 浏览器半边单独一个 program：host 与 client 两半会用不同的服务合并同一个 cordis Context 键，
   // 一个 program 里放不下两边——这也是仓库把 tsconfig.host.json 与 tsconfig.client.json 分开的原因。
   //
-  // 引入 vendor/cordis 让 TS 走它的产物；client/index.ts 目前只 import type { Context }。
+  // 引入 vendor/cordis 让 TS 走它的产物；client/index.tsx 只 import type { Context }。
+  //
+  // shared/ 与 client/ 同属浏览器半边：`shared/protocol.ts` 是两条路由两侧共用的线格式，
+  // 它没有 `@deepseek-ai/*` import，所以两个 program 都能放（Blackboard 的 include 同形）。
   "extends": "../../tsconfig.base.client.json",
   "compilerOptions": {
     "composite": false,
@@ -11,10 +14,19 @@
     "lib": ["es2024", "dom", "dom.iterable"]
   },
   "include": [
+    "shared/**/*.ts",
     "client/**/*.ts",
     "client/**/*.tsx"
   ],
   "references": [
-    { "path": "../../vendor/cordis" }
+    { "path": "../../vendor/cordis" },
+    // 与 Blackboard 同一份引用表：这些包的类型产物就是客户端半边的编译环境（它们的源码要
+    // CSS Modules 环境，本目录不打包 CSS）。列表照 client/index.tsx 与 client/panel.tsx 真正
+    // 用到的声明来：`ctx.locale`、`conversation.view` 的 SlotMap 行、会话作用域标准位、四个份额。
+    { "path": "../../packages/client/locale" },
+    { "path": "../../packages/client/ui-conversation" },
+    { "path": "../../packages/client/ui-renderer" },
+    { "path": "../../packages/client/ui-session" },
+    { "path": "../../packages/client/ui-slots" }
   ]
 }

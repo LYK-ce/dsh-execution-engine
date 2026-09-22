@@ -1,5 +1,5 @@
 /**
- * 把 client/index.ts 打成 DSH 客户端模块表要的 CJS bundle：lib/client.js。
+ * 把 client/index.tsx 打成 DSH 客户端模块表要的 CJS bundle：lib/client.js。
  *
  * 不能复用仓库的 clientBundle()（packages/client/tsdown.client.ts 的 workspaceManifest 只扫 packages/*\/*），
  * 所以这里自己复刻 bundle 协议的三件事：CJS 输出、模块表 banner/footer、基线模块外部化。
@@ -36,7 +36,7 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)))
 
 const result = spawnSync(process.execPath, [
   createRequire(import.meta.url).resolve('esbuild/bin/esbuild'),
-  join(root, 'client', 'index.ts'),
+  join(root, 'client', 'index.tsx'),
   '--bundle',
   '--format=cjs',
   '--platform=browser',

@@ -113,6 +113,16 @@ test('package.json 声明了客户端半边，且包名就是模块表 id', () =
   )
 })
 
+test('客户端 bundle 的入口是 client/index.tsx，且脚本指的就是那个文件', () => {
+  const script = readFileSync(BUILD_SCRIPT, 'utf8')
+  // 阶段 6 把入口从 .ts 改成了 .tsx（面板是 JSX）。这条断言把两处一起钉住：脚本里写的那个文件名，
+  // 以及它必须真的存在——只改一边时 esbuild 会以"找不到入口"失败，而那是构建期，不是评审期。
+  assert.match(script, /['"]index\.tsx['"]/u, 'build/build-client.mjs must bundle client/index.tsx')
+  assert.doesNotMatch(script, /['"]index\.ts['"]/u, 'the pre-阶段 6 entry name must be gone')
+  assert.ok(existsSync(resolve(ROOT, 'client', 'index.tsx')), 'client/index.tsx must exist')
+  assert.ok(!existsSync(resolve(ROOT, 'client', 'index.ts')), 'the renamed-away client/index.ts must not come back')
+})
+
 test('两个 face 的 program 都能解析出输入文件', () => {
   for (const name of FACE_CONFIGS) {
     // include 匹配不到文件时 tsc 报 TS18003；fileNames 非空就是它的机器可检形式。

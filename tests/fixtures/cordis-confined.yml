@@ -60,5 +60,16 @@
 - id: jobs
   name: '@deepseek-ai/dsh-jobs-local'
 
+# 阶段 6 追加：与 cordis.yml 同一对行。**本插件已改成可选注入 connection**，所以这两行不是为了
+# 让它激活（没有 connection 也能跑程序），而是为了让 B14a 能在这个组合里拿到真实 connection。
+# connection 自己的 inject 是 ['credentials']，缺任何一个 B14a 都拿不到服务。
+- id: credentials
+  name: '@deepseek-ai/dsh-credentials-local'
+  config:
+    watch: false
+
+- id: client-connection
+  name: '@deepseek-ai/dsh-client-connection'
+
 - id: execution-engine-host
   name: '../../host/index.ts'

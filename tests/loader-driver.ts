@@ -17,6 +17,9 @@
  * - B0 不给发起者的 `run_program` 调用大声失败——这一层判空在 `host/index.ts`，是生产上唯一
  *   会触发它的地方（`SubagentBindingOptions.parent` 是必填，binding 里没有这一支）。
  * - B8 没有程序在跑时 `cancel_program` 正常返回（幂等，不是错误）。
+ * - B14a 两条面板 route 真的挂在 `ctx.connection.fetch` 上（经 connection 的共享 fetch 处理函数发
+ *   请求，所以走的是真的注册结果），以及查询参数的边界（缺 sessionId、负的 `since` 都是 400）。
+ *   这一段不跑程序，所以它在两个组合里都跑得到。
  *
  * 不受限组合（`tests/fixtures/cordis.yml`，danger-full-access）：
  * - B1 程序能跑、`process` 真的执行外部程序（`python -c 'print("EE_OK")'`）；
@@ -42,6 +45,10 @@
  *   `outcome === 'error'`、`flow/start.code` 是提交的正文原文，而内部 `trace` 通道不在程序可见面里。
  *   取消一个正在 `await process(sleep)` 的程序时，那条再也没人能闭合的调用由宿主补发一条
  *   `synthetic` 的 `flow/call-end`——而且它先于 `flow/end` 到达。
+ * - B14b 面板状态与 `flow/*` 一致（程序正文逐字、轨迹的 callId/行号/耗时/结局逐条等于事件、
+ *   report 同序、没有还开着的调用）、`since` 增量的三种取值（最新/中间/比最新还大）、以及
+ *   **经路由取消**：与工具取消同一条路径，响应回来时临时目录已经删掉（与 B9 同一判据形态）、
+ *   run 的终态在面板状态里是 `killed`，再取消一次幂等地回 `cancelled: false`。
  *
  * 受限组合（`tests/fixtures/cordis-confined.yml`，workspace-write）：
  * - B5 `process` 起的外部进程过发起会话的文件策略：同一个程序里，写工作目录外的路径被
@@ -66,6 +73,8 @@ import type { JobId } from '@deepseek-ai/dsh-jobs'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { MessageId, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { FlowCallEndEvent, FlowCallStartEvent, FlowStartEvent } from '../host/flow-events.ts'
+import { CANCEL_PATH, STATE_PATH } from '../shared/protocol.ts'
+import type { FlowCallEntry, FlowReportEntry, FlowSnapshot } from '../shared/protocol.ts'
 import { FAILURE_DIAGNOSTIC, FAILURE_MARKER, SCRIPTED_REPLY, scriptedStarts } from './fixtures/scripted-subagent-provider.ts'
 import * as plugin from '../host/index.ts'
 
@@ -143,6 +152,51 @@ const sandboxMode = policyService.resolve().mode
 
 const sessions = requireService(ctx.get('sessions'), 'the session store')
 const agents = requireService(ctx.get('agents'), 'the agent registry')
+
+/**
+ * 面板两条 route 的驱动面：**经真实 connection 服务**发请求。
+ *
+ * `createSharedFetchHandler` 是 connection 的公开面（packages/client/connection/src/rpc-host.ts:117）：
+ * 它按 exact path 分派到各插件注册的 Fetch route，所以驱动走的是真的注册结果，而不是绕过注册直接调
+ * 处理函数——"路由挂上了没有"因此也在判据里。信任检查与浏览器鉴权在物理载体那一层
+ * （`requestRejection`），本驱动不经过它。
+ */
+const connection = requireService(ctx.get('connection'), 'the client-connection service')
+const panelApi = connection.createSharedFetchHandler('/api')
+
+/**
+ * 取一次面板状态。
+ * @param sessionId - 目标会话。
+ * @param since - 增量游标；不给就是"全量"。
+ * @returns 路由的原始响应。
+ */
+async function readPanelState(sessionId: string, since?: number): Promise<Response> {
+  const query = `sessionId=${encodeURIComponent(sessionId)}${since === undefined ? '' : `&since=${String(since)}`}`
+  return await panelApi.fetch(new Request(`http://dsh.invalid${STATE_PATH}?${query}`))
+}
+
+/**
+ * 经路由取消一次。
+ * @param sessionId - 目标会话。
+ * @returns 路由的原始响应。
+ */
+async function cancelPanel(sessionId: string): Promise<Response> {
+  return await panelApi.fetch(
+    new Request(`http://dsh.invalid${CANCEL_PATH}?sessionId=${encodeURIComponent(sessionId)}`, { method: 'POST' }),
+  )
+}
+
+/**
+ * 读一份面板状态并断言它是 200。
+ * @param sessionId - 目标会话。
+ * @param since - 增量游标；不给就是"全量"。
+ * @returns 解析后的状态快照。
+ */
+async function panelState(sessionId: string, since?: number): Promise<FlowSnapshot> {
+  const response = await readPanelState(sessionId, since)
+  assert.equal(response.status, 200, `reading the panel state failed with ${String(response.status)}`)
+  return await response.json() as FlowSnapshot
+}
 
 /** 工作目录下本插件专属的 run 临时目录根（host/tmp-dir.ts 的 RUN_ROOT）。 */
 const runRoot = join(policyService.resolve().workspaceRoot, '.execution-engine')
@@ -329,6 +383,25 @@ try {
   for (const declaration of ['declare function dispatchsubagent(', 'declare function report(', 'declare function process(', 'declare function processOrThrow(', 'flow.tmpDir', 'declare const console', 'cancel_program']) {
     assert.ok(sdk.text.includes(declaration), `the SDK section must declare ${declaration}`)
   }
+
+  // ---- B14a：两条面板 route 真的挂在 connection 上（两个组合共有，不需要跑程序） ------
+  // 阶段 6 的面板只能经路由拿到状态（`flow/*` 是 Cordis 事件，出不了宿主进程），所以"路由挂上了
+  // 没有"本身就是判据。这一段不跑程序，纯粹看注册结果与查询参数边界。
+  const neverRan = 'session-that-never-ran'
+  assert.deepEqual(
+    await panelState(neverRan),
+    { run: null, revision: 0, entries: [], reset: true },
+    'a session that never ran a program must read as an empty panel',
+  )
+  const missingSession = await panelApi.fetch(new Request(`http://dsh.invalid${STATE_PATH}`))
+  assert.equal(missingSession.status, 400, 'a state read without sessionId must be a 400')
+  assert.equal((await readPanelState(neverRan, -1)).status, 400, 'since must be a non-negative safe integer')
+  assert.equal(
+    (await panelApi.fetch(new Request(`http://dsh.invalid${CANCEL_PATH}`, { method: 'POST' }))).status,
+    400,
+    'a cancel without sessionId must be a 400',
+  )
+  process.stdout.write('B14a the panel routes are mounted on ctx.connection.fetch: OK\n')
 
   // ---- B0：没有发起者的调用大声失败（两个组合共有） ---------------------------
   // `ToolRunContext.agent` 是可选字段，所以 `host/index.ts` 自己判空；它是生产上唯一会触发那句
@@ -926,6 +999,97 @@ return r.code
       `B13: the synthetic end must arrive before flow/end, got ${JSON.stringify(pendingOrder)}`,
     )
     process.stdout.write('B13 cancel closes an in-flight call with a synthetic end: OK\n')
+
+    // ---- B14b：面板状态与事件一致、since 增量、经路由取消 ------------------------
+    // 一行一条，行号就是数组下标 + 1：轨迹里的 `line` 与 `flow/call-*` 逐条对照。
+    const b14Program = [
+      "await report('b14 first')",                                  // 1
+      "const one = await process(['python', '-c', 'print(1)'])",     // 2
+      'for (let index = 0; index < 2; index++) {',                   // 3
+      "  await process(['python', '-c', 'print(2)'])",               // 4
+      '}',                                                           // 5
+      "await report('b14 second')",                                  // 6
+      'return one.code',                                             // 7
+    ].join('\n')
+    const routed = await makeAgent('routed')
+    const b14 = await startProgram(b14Program, routed.agent)
+    const b14Output = await jobOutput(b14.jobId, routed.agent)
+    assertProgramSucceeded(b14Output, 'B14')
+    await waitFor(() => eventsOf(flowEnd, b14.jobId).length >= 1, 20_000, 'B14')
+
+    const first = await panelState(routed.agent.id)
+    assert.equal(first.run?.runId, b14.jobId)
+    assert.equal(first.run?.code, b14Program, 'B14: the panel must show the submitted program verbatim')
+    assert.equal(first.run?.lineCount, 7)
+    assert.equal(first.run?.status, 'completed')
+    assert.equal(first.run?.discarded, 0)
+    assert.equal(first.reset, false)
+
+    const panelCalls = first.entries.filter((entry): entry is FlowCallEntry => entry.kind === 'call')
+    const panelReports = first.entries.filter((entry): entry is FlowReportEntry => entry.kind === 'report')
+    const b14Starts = eventsOf(callStart, b14.jobId) as FlowCallStartEvent[]
+    const b14Ends = eventsOf(callEnd, b14.jobId) as FlowCallEndEvent[]
+    // 轨迹就是 `flow/call-*` 那一串：按 callId 成对、行号与耗时逐条相等、没有还开着的调用。
+    assert.deepEqual(
+      panelCalls.map(entry => [entry.member, entry.line]),
+      b14Starts.map(event => [event.member, event.line]),
+      'B14: every traced call must match its flow/call-start',
+    )
+    assert.deepEqual(panelCalls.map(entry => entry.callId), b14Starts.map(event => event.callId))
+    assert.deepEqual(panelCalls.map(entry => entry.callId), b14Ends.map(event => event.callId))
+    assert.deepEqual(panelCalls.map(entry => entry.state), b14Ends.map(event => event.outcome))
+    assert.deepEqual(panelCalls.map(entry => entry.ms), b14Ends.map(event => event.ms))
+    assert.equal(panelCalls.some(entry => entry.state === 'open'), false, 'B14: every call must be closed')
+    // 条目按发生顺序，序号连续——增量拼接的前提。
+    assert.deepEqual(first.entries.map(entry => entry.seq), first.entries.map((_, index) => index))
+    // report 有序，且与 `flow/report` 同序。
+    assert.deepEqual(panelReports.map(entry => entry.text), ['b14 first', 'b14 second'])
+    assert.deepEqual(
+      panelReports.map(entry => entry.text),
+      (eventsOf(flowReport, b14.jobId) as { text: string }[]).map(event => event.text),
+    )
+
+    // since 的三种取值：等于最新（空增量）、中间（只回新增）、比最新还大（整份重来）。
+    const caughtUp = await panelState(routed.agent.id, first.revision)
+    assert.equal(caughtUp.reset, false)
+    assert.deepEqual(caughtUp.entries, [])
+    assert.equal(caughtUp.revision, first.revision)
+    const partial = await panelState(routed.agent.id, 1)
+    assert.equal(partial.reset, false)
+    assert.deepEqual(partial.entries, first.entries.slice(1))
+    const beyond = await panelState(routed.agent.id, first.revision + 5)
+    assert.equal(beyond.reset, true)
+    assert.deepEqual(beyond.entries, first.entries)
+
+    // 经路由取消：与工具取消同一条路径。
+    const b14LiveProgram = `
+const r = await process(['python', '-c', 'import time; time.sleep(60)'])
+return r.code
+`
+    const b14Live = await startProgram(b14LiveProgram, routed.agent)
+    await waitFor(() => eventsOf(callStart, b14Live.jobId).length >= 1, 20_000, 'B14-cancel')
+    const cancelResponse = await cancelPanel(routed.agent.id)
+    assert.equal(
+      cancelResponse.status,
+      200,
+      `cancelling through the route failed with ${String(cancelResponse.status)}`,
+    )
+    const cancelled = await cancelResponse.json() as { cancelled: boolean; jobId?: string; status?: string }
+    assert.equal(cancelled.cancelled, true)
+    assert.equal(cancelled.jobId, b14Live.jobId)
+    assert.equal(cancelled.status, 'killed')
+    // 与 B9 同一个判据形态：响应回来时 run 的临时目录已经删掉。
+    assert.deepEqual(liveRunDirs(), [], 'B14: the route cancel must return after the run temporary directory is gone')
+    await waitFor(() => eventsOf(flowEnd, b14Live.jobId).length >= 1, 20_000, 'B14-cancel-end')
+    const killedState = await panelState(routed.agent.id)
+    assert.equal(killedState.run?.runId, b14Live.jobId)
+    assert.equal(killedState.run?.status, 'killed')
+    assert.equal(killedState.run?.detail, 'cancelled by the initiating agent')
+    // 幂等：没有在跑的程序时回 cancelled: false（design.md §4.4）。
+    const idleCancel = await cancelPanel(routed.agent.id)
+    assert.equal(idleCancel.status, 200)
+    assert.deepEqual(await idleCancel.json(), { cancelled: false })
+    process.stdout.write('B14b panel state matches flow/*, since deltas, and route cancel: OK\n')
   } else {
     // ---- B5：受限组合——工作目录外的写被策略拒绝，工作目录内的写成功 -----------
     // 两条用例在同一个程序、同一个 `process` 绑定、同一份策略下跑同一段 python 脚本，
