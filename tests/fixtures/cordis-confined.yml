@@ -51,5 +51,14 @@
 - id: subagents
   name: '@deepseek-ai/dsh-subagent'
 
+# 阶段 3 追加：后台 job 注册表与 agent 注册表。job 的 owner 必须是**活着的、已注册的** agent
+# 实例——jobs-local 的 `ensureOwnerCleanup` 会比对 `agents.get(ownerId) === owner`
+# （packages/jobs/jobs-local/src/index.ts:448-456）。
+- id: agents
+  name: '@deepseek-ai/dsh-agent'
+
+- id: jobs
+  name: '@deepseek-ai/dsh-jobs-local'
+
 - id: execution-engine-host
   name: '../../host/index.ts'

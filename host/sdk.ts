@@ -3,6 +3,7 @@
  *
  * 这份文本进系统提示，就是主 agent 写程序时唯一的 API 依据。它按阶段列出能力面增删：
  * 这里只描述已经存在的原语——`dispatchsubagent` 属于阶段 2，`report` 属于阶段 4。
+ * 阶段 3 改了工具的时序：程序在后台跑，结果不回主 agent（design.md §4.1、§6.5）。
  *
  * 超时那两个数是部署可配的（design.md §9），所以正文由**已解析的**策略生成：写死数字
  * 会让部署改了 Config 之后，模型看到的是一份假文档。
@@ -22,14 +23,22 @@ export const SDK_SECTION_NAME = 'execution-engine-sdk'
 export function sdkText(timeouts: ProcessTimeouts): string {
   return `## run_program
 
-\`run_program\` 执行一段 TypeScript 程序。程序跑在一个独立进程里：顶层 \`await\` 与 \`return\` 可用，
-\`return\` 的值会作为结果交回。程序里不确定的步骤派子 agent，确定的步骤跑外部程序——
+\`run_program\` 把一段 TypeScript 程序交给执行引擎，**立刻返回一个 job id**：程序在后台跑，
+不阻塞你当前的回合。每个会话同时只能有一个程序在跑；已经有程序在跑时这次启动会被拒绝，
+错误里带着那个 job id，要先 \`cancel_program\`。
+
+**程序的结果不会回到你这里**：它跑完、失败或被取消都不会通知你。你在本回合能做的是启动与取消。
+所以程序要写成一个能自己跑完的整体：不确定的步骤派子 agent，确定的步骤跑外部程序——
 写完之后执行是机械的。
+
+\`cancel_program\` 在**清理真正完成之后**才返回：进程、子 agent 与临时目录都已经收干净。
+程序里**没有 \`await\` 的外部程序也算在清理范围内**，所以取消可能要等到它结束——
+这段时间受那一次 \`process\` 自己的超时约束。
 
 程序是**可擦除 TypeScript**：类型只是装饰，运行时被剥掉，没有编译期检查。
 \`enum\`、带运行时语义的 \`namespace\`、构造器参数属性一类需要生成代码的写法会被拒绝，报错会说明怎么改。
 
-程序里可用的 API：
+程序在独立进程里运行，顶层 \`await\` 与 \`return\` 可用。程序里可用的 API：
 
 \`\`\`ts
 /** 本次 run 的上下文。 */
@@ -62,7 +71,7 @@ declare function exists(path: string): Promise<boolean>
 /** 标准 fetch。 */
 declare function fetch(input: string, init?: object): Promise<Response>
 
-/** 程序自己的输出；这些内容会随结果一起交回。 */
+/** 程序自己的输出；它随这次 run 的结果一起被记录。 */
 declare const console: {
   log(...args: unknown[]): void
   info(...args: unknown[]): void

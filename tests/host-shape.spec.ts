@@ -62,7 +62,7 @@ test('name 是全小写连字符的 Loader 名，不是包名', () => {
   assert.equal(type.value, 'execution-engine')
 })
 
-test('inject 声明阶段 2 真正用得到的服务', () => {
+test('inject 声明阶段 3 真正用得到的服务', () => {
   const declaration = declarationOf('inject')
   assert.ok(ts.isVariableDeclaration(declaration), 'inject must be a const declaration')
   const initializer = declaration.initializer
@@ -73,7 +73,9 @@ test('inject 声明阶段 2 真正用得到的服务', () => {
     // 走 ctx.get 读取（先例 packages/shell/tool-bash/src/index.ts:193）。
     // sandbox 则必须在：process 每次都要过它的 confine。
     // subagents 也必须在：dispatchsubagent 的归属就是它唯一的落点（design.md §5.1）。
-    ['tools', 'ptcRuntime', 'subprocess', 'subagents', 'sandbox', 'systemPrompt'],
+    // jobs 是阶段 3 的后台化落点：run_program 注册 job、cancel_program 取消它
+    // （design.md §4.1）；controller 也由本插件自己挂，所以这一项缺了整个插件不会激活。
+    ['tools', 'jobs', 'ptcRuntime', 'subprocess', 'subagents', 'sandbox', 'systemPrompt'],
   )
 })
 

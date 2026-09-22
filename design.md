@@ -244,11 +244,21 @@ DSH 的投递接口有四种形态，本设计选 followup 而非 inject：
 
 这是一个干净的"控制面 / 数据面"划分：程序通过 `report` 单向汇报，主 agent 通过"启动 / 取消"单向控制。**没有任何双向调用，所以结构上不可能死锁。**
 
+**但这三条在默认部署里守不住，如实记账：** 标准 preset 挂着 `@deepseek-ai/dsh-tool-jobs`（`packages/preset/agent-presets/presets/standard/agent.cordis.yml:74-75`），它① 向 owner 投递 job 完成通知，② 把 `job_output` / `job_list` / `job_kill` 三个通用工具暴露给模型。所以主 agent 实际还能**读走程序全文**、还能**杀掉 job**。`JobStart` 没有让生产者退出通知的开关，`reported` 归注册表所有，**本插件从生产方一侧抑制不了**。
+
+缓解手段：
+
+- **唤醒**是部署可配的——`tool-jobs` 的 `completionDelivery: 'quiet' | 'wakeup'`（默认 `wakeup`，`packages/jobs/tool-jobs/src/index.ts:28,50`）。想要 §6.5 的 fire-and-forget 性质，部署侧配成 `quiet` 即可，**纯配置，不动 `packages/`**。
+- 三个通用工具属于 preset，本插件删不掉。**"只能做三件事"因此是一条设计意图，不是默认部署下的事实。**
+- 生产者侧的退出开关列为阶段 7 的可选项（要动 `packages/`，当前范围之外）。
+
 ### 6.5 fire-and-forget
 
 对主 agent 而言程序是 fire-and-forget：**它不需要知道程序何时结束、为什么结束**（跑完 / 失败 / 被用户取消都一样）。
 
 这不影响正确性，因为主 agent 本来就不阻塞在程序上——它只是继续干自己的事，report 来了就处理。但有一条推论必须处理，即 §4.4 的"未投递 report 作废"。
+
+（§6.4 末尾记的 `tool-jobs` 完成通知会额外唤醒一次；它不破坏 fire-and-forget 的正确性，只是让"不需要知道"变成"会知道"。部署可用 `completionDelivery: 'quiet'` 关掉。）
 
 ## 7. 语言与运行时
 

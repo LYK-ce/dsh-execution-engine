@@ -1,23 +1,37 @@
 #!/usr/bin/env node
 /**
- * 阶段 1/2 的真实组合验证：用 app-boot 的 boot() 起一份最小 Loader 组合，断言插件与两个工具
- * 已注册、模型可见 schema 存在、`.d.ts` 系统提示段进了装配结果，并真的跑几段程序。
+ * 阶段 1/2/3 的真实组合验证：用 app-boot 的 boot() 起一份最小 Loader 组合，断言插件与工具已注册、
+ * 模型可见 schema 存在、`.d.ts` 系统提示段进了装配结果，并真的跑几段程序。
+ *
+ * 阶段 3 起 `run_program` 是**后台 job**：工具立刻返回 `{ jobId, status: 'running' }`，程序在
+ * 后台继续跑。所以每个用例都是两段——(1) 断言工具立刻返回，(2) 等 job 结算后从 job 输出里取回
+ * 程序结果。阶段 1/2 对程序结果的断言（B1 的 `EE_OK`、B2 的退出码/超时、B6 的文本与归属）原样保留。
+ *
+ * 读取路径（phase3-plan §11 Q1 裁决丙）：本阶段**不给模型任何读取工具**，所以驱动走的是
+ * `ctx.jobs` 自己的契约——`wait` 等终态、`read` 取输出，`caller` 就是发起本次 run 的那个 agent
+ * 实例（注册表按 owner 的会话 id 授权）。
  *
  * 分支由传入 fixture 解析出的沙箱模式决定（见 sandboxMode），不引入额外开关：
  *
  * 两个组合共有：
  * - B0 不给发起者的 `run_program` 调用大声失败——这一层判空在 `host/index.ts`，是生产上唯一
  *   会触发它的地方（`SubagentBindingOptions.parent` 是必填，binding 里没有这一支）。
+ * - B8 没有程序在跑时 `cancel_program` 正常返回（幂等，不是错误）。
  *
  * 不受限组合（`tests/fixtures/cordis.yml`，danger-full-access）：
  * - B1 程序能跑、`process` 真的执行外部程序（`python -c 'print("EE_OK")'`）；
+ * - B1b `run_program` **立刻**返回：程序 sleep 4s，工具显著更早返回且 status 是 running；
  * - B2 非零退出码正常返回、`processOrThrow` 抛出、超时生效且显著早于脚本自己的 30s；
  * - B3 超过 `maxTimeoutMs` 的请求在解析期被拒，且**没有启动任何进程**（哨兵文件不出现）；
  * - B4 超时后整个进程树被清干净（脚本 fork 出的子进程不会稍后写出哨兵文件）；
  * - B6 洞与归属：`dispatchsubagent` 拿回脚本化 provider 的固定文本；provider 记到的 `parent`
  *   逐字是发起本次调用的 agent；provider 取的是 Config 里的 `subagentProvider`；
  *   子 agent 非正常完成时 `dispatchsubagent` 抛出，消息里带上 reason 与 provider 写的诊断。
- *   （判据 3「子 agent 输出不进主 agent 上下文」本阶段只能间接说明，明记为未验证，阶段 4/6 补。）
+ * - B7 单例：程序 A 在跑时再启动被拒（错误里带 A 的 job id）；取消 A 之后能立刻启动 B，
+ *   且取消返回时 A 的临时目录已经消失；
+ * - B9 取消等清理：给一个 fork 了子进程并 sleep 的程序发取消，**返回的那一刻**两个进程都已消失、
+ *   临时目录已删除，3s 后本该出现的哨兵文件始终没有出现；
+ * - B10 job owner 生命周期：dispose 发起 agent 的 scope → job 被取消、清理完成、记录被删除。
  *
  * 受限组合（`tests/fixtures/cordis-confined.yml`，workspace-write）：
  * - B5 `process` 起的外部进程过发起会话的文件策略：同一个程序里，写工作目录外的路径被
@@ -25,19 +39,20 @@
  *
  * 用法（cwd = 仓库根，必须带 tsx，否则裸包名解析不到源码）：
  *   node --import tsx/esm Workspace/ExecutionEngine/tests/loader-driver.ts \
- *     Workspace/ExecutionEngine/tests/fixtures/cordis.yml              # B0–B4、B6
+ *     Workspace/ExecutionEngine/tests/fixtures/cordis.yml              # B0–B4、B6–B10
  *   node --import tsx/esm Workspace/ExecutionEngine/tests/loader-driver.ts \
- *     Workspace/ExecutionEngine/tests/fixtures/cordis-confined.yml     # B0、B5
+ *     Workspace/ExecutionEngine/tests/fixtures/cordis-confined.yml     # B0、B5、B8
  *
  * 成功判据：exit 0，stdout 末尾 `LOADER_SMOKE_OK`。
  */
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join, sep } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { boot, resolveConfigPath } from '@deepseek-ai/dsh-app-boot'
+import type { JobId } from '@deepseek-ai/dsh-jobs'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { FAILURE_DIAGNOSTIC, FAILURE_MARKER, SCRIPTED_REPLY, scriptedStarts } from './fixtures/scripted-subagent-provider.ts'
 import * as plugin from '../host/index.ts'
@@ -55,7 +70,10 @@ const configPath = process.argv[2]
 if (configPath === undefined) throw new Error('loader-driver requires a config path')
 
 assert.equal(plugin.name, 'execution-engine')
-assert.deepEqual(plugin.inject, ['tools', 'ptcRuntime', 'subprocess', 'subagents', 'sandbox', 'systemPrompt'])
+assert.deepEqual(
+  plugin.inject,
+  ['tools', 'jobs', 'ptcRuntime', 'subprocess', 'subagents', 'sandbox', 'systemPrompt'],
+)
 assert.equal(typeof plugin.apply, 'function')
 assert.ok(!('default' in plugin), 'the plugin module must not export default (postmortem 0001)')
 
@@ -77,46 +95,152 @@ function isInside(root: string, path: string): boolean {
   return path === root || path.startsWith(root + sep)
 }
 
-/**
- * 调一次 run_program，返回模型可见文本。程序自己失败不是工具失败：结果文本里带
- * `程序执行失败（` 小节，而工具结果本身仍是成功的。
- *
- * `agent` 必须给：阶段 2 起 `run_program` 要求归属明确（design.md §5.1），
- * 没有发起者的调用会大声失败——真实链路里这个字段由 agent loop 填。
- */
-async function callRunProgram(code: string): Promise<string> {
-  const result = await ctx.tools.execute({
+/** 工具结果里的文本块拼起来——模型看到的就是这些。 */
+function textOf(result: { content: readonly { type: string; text?: string }[] }): string {
+  return result.content.filter(block => block.type === 'text').map(block => block.text).join('')
+}
+
+/** 调一次工具，返回工具结果本身（不做 isError 断言：好几条用例看的正是失败文本）。 */
+function callTool(name: string, args: unknown, owner?: Agent) {
+  return ctx.tools.execute({
     signal: new AbortController().signal,
-    callId: ToolCallId(`execution-engine-run-${String(++callSeq)}`),
-    name: 'run_program',
-    agent: initiator,
-    arguments: { code },
+    callId: ToolCallId(`execution-engine-${name}-${String(++callSeq)}`),
+    name,
+    arguments: args,
+    ...owner === undefined ? {} : { agent: owner },
   })
-  const text = result.content.filter(block => block.type === 'text').map(block => block.text).join('')
-  if (result.isError) throw new Error(`run_program itself failed: ${text}`)
-  const value = result.value as { output: string }
-  // 渲染只有一处（host/engine.ts），模型看到的文本必须就是那个值。
-  assert.equal(text, value.output, 'the rendered content must be the canonical output value')
-  return value.output
 }
 
 /**
- * 调一次 `run_program` 但**不给发起者**，返回工具结果文本。
- *
- * 与 `callRunProgram` 不同，这里不做 `isError` 断言：这一条要看的正是那句失败文本本身。
- * 两个 fixture 都挂了 sandboxPolicy，所以 `authorityOf` 能先解析出工作目录，
- * 走到的是"没有发起者"那一句，而不是它上面那句 cwd 缺失。
- * @param code - 程序源码。
- * @returns 工具结果里的文本。
+ * 装配前提：fixture 必须挂上这个服务。返回非可选类型，好让下面的闭包也拿得到收窄结果。
+ * @param service - `ctx.get` 的结果。
+ * @param label - 缺了它时的错误说明。
+ * @returns 同一个服务，类型里没有 `undefined`。
  */
-async function callRunProgramWithoutAgent(code: string): Promise<string> {
-  const result = await ctx.tools.execute({
-    signal: new AbortController().signal,
-    callId: ToolCallId(`execution-engine-no-agent-${String(++callSeq)}`),
-    name: 'run_program',
-    arguments: { code },
-  })
-  return result.content.filter(block => block.type === 'text').map(block => block.text).join('')
+function requireService<T>(service: T | undefined, label: string): T {
+  if (service === undefined) throw new Error(`the fixture must mount ${label}`)
+  return service
+}
+
+/**
+ * 传入 fixture 的已解析文件策略，也是本次分支的选择依据（见文件头）。
+ * `sandboxPolicy` 不在 `inject` 里，所以用严格的 `ctx.get` 读全局服务（postmortem 0001）。
+ */
+const policyService = requireService(ctx.get('sandboxPolicy'), 'sandboxPolicy')
+const sandboxMode = policyService.resolve().mode
+
+const sessions = requireService(ctx.get('sessions'), 'the session store')
+const agents = requireService(ctx.get('agents'), 'the agent registry')
+
+/** 工作目录下本插件专属的 run 临时目录根（host/tmp-dir.ts 的 RUN_ROOT）。 */
+const runRoot = join(policyService.resolve().workspaceRoot, '.execution-engine')
+
+/**
+ * 当前还在的 run 临时目录。每个 run 一个独立子目录，run 结束（含取消）整体删除，根目录自己
+ * 留在原地——所以"清理完成"的观察就是这里为空。
+ * @returns 子目录名列表。
+ */
+function liveRunDirs(): string[] {
+  return existsSync(runRoot) ? readdirSync(runRoot) : []
+}
+
+/**
+ * 建一个真的发起 agent：真 Session + 自己的 scope fiber + 注册进 `ctx.agents`。
+ *
+ * 阶段 3 起发起者同时是 job 的 owner，而 owner 必须是**注册表里活着的那个实例**——
+ * jobs-local 的 `ensureOwnerCleanup` 比对 `agents.get(id) === owner`，不等就拒绝
+ * （packages/jobs/jobs-local/src/index.ts:448-456）。所以不能再用一个只有 id 的替身。
+ *
+ * 注册表 disposal 与 scope disposal 是两件事：前者摘掉注册记录，后者才是"会话关闭"，
+ * job 的 drain 挂在后者上（先例 packages/jobs/tool-jobs/tests/tool-jobs.spec.ts:44-71）。
+ * @param label - 会话 id 用的前缀，便于在日志里区分。
+ * @returns 发起者与它自己的 scope fiber。
+ */
+async function makeAgent(label: string) {
+  const scope = ctx.plugin(() => {})
+  const session = sessions.create(undefined, { meta: { cwd: policyService.resolve().workspaceRoot } })
+  const agent = {
+    id: session.id,
+    session,
+    options: {},
+    status: 'running',
+    ctx: scope.ctx,
+  } as unknown as Agent
+  await agents.register(agent)
+  assert.equal(agents.get(session.id), agent, `${label}: the owner must be the registered instance`)
+  return { agent, scope }
+}
+
+const initiator = (await makeAgent('initiator')).agent
+
+/**
+ * 调一次 `run_program` 并立刻返回工具结果。
+ * @param code - 程序源码。
+ * @param owner - 发起者；省略即不给发起者（B0 用）。
+ * @returns 工具结果。
+ */
+function callRunProgram(code: string, owner?: Agent) {
+  return callTool('run_program', { code }, owner)
+}
+
+/** 调一次 `cancel_program`。 */
+function callCancelProgram(owner?: Agent) {
+  return callTool('cancel_program', {}, owner)
+}
+
+/** 一次 run_program 调用：job id、返回时的状态、模型可见文本与调用耗时。 */
+interface ProgramStart {
+  readonly jobId: string
+  readonly status: string
+  readonly text: string
+  readonly elapsedMs: number
+}
+
+/**
+ * 提交一段程序并断言工具**立刻**返回。
+ *
+ * 返回时程序还在跑：`status` 必须是 `running`，文本里必须带上 job id（渲染只有一处，
+ * 见 `host/tool.ts` 的 `render`）。
+ * @param code - 程序源码。
+ * @param owner - 发起者；缺省用 `initiator`。
+ * @returns job id、状态、文本与耗时。
+ */
+async function startProgram(code: string, owner: Agent = initiator): Promise<ProgramStart> {
+  const startedAt = Date.now()
+  const result = await callRunProgram(code, owner)
+  const elapsedMs = Date.now() - startedAt
+  const text = textOf(result)
+  if (result.isError) throw new Error(`run_program itself failed: ${text}`)
+  const value = result.value as { jobId: string; status: string }
+  assert.equal(value.status, 'running', `run_program must return a live job:\n${text}`)
+  assert.ok(text.includes(value.jobId), `the rendered content must name the job:\n${text}`)
+  return { jobId: value.jobId, status: value.status, text, elapsedMs }
+}
+
+/**
+ * 等一个 job 结算，并从它的输出里取回程序结果（阶段 3 的读取路径，见文件头）。
+ *
+ * `caller` 必须是发起本次 run 的那个 agent 实例：注册表按 owner 的会话 id 授权，换一个 caller
+ * 会直接抛 "belongs to another session"（packages/jobs/jobs-local/src/index.ts:356-360）。
+ * @param jobId - `run_program` 交回的 id。
+ * @param owner - 发起者。
+ * @param timeoutMs - 等待上界；超了就是判据没跑成，不是判据失败。
+ * @returns 程序结果的渲染文本。
+ */
+async function jobOutput(jobId: string, owner: Agent = initiator, timeoutMs = 120_000): Promise<string> {
+  const id = jobId as unknown as JobId
+  const snapshot = await ctx.jobs.wait(id, timeoutMs, owner)
+  assert.ok(
+    snapshot.status !== 'running' && snapshot.status !== 'stopping',
+    `job ${jobId} did not settle within ${String(timeoutMs)}ms (status ${snapshot.status})`,
+  )
+  return ctx.jobs.read(id, owner).text
+}
+
+/** 跑完一段程序并取回渲染结果——B1–B6 的判据原样保留，只是改从 job 输出里取。 */
+async function runToCompletion(code: string, owner?: Agent): Promise<string> {
+  const started = await startProgram(code, owner)
+  return await jobOutput(started.jobId, owner ?? initiator)
 }
 
 /** 程序失败只体现在文本里（工具结果不带 isError 字段）。 */
@@ -131,42 +255,43 @@ function returned(output: string): unknown {
   return JSON.parse(output.slice(index + VALUE_MARKER.length))
 }
 
-/**
- * 传入 fixture 的已解析文件策略，也是本次分支的选择依据（见文件头）。
- * `sandboxPolicy` 不在 `inject` 里，所以用严格的 `ctx.get` 读全局服务（postmortem 0001）。
- */
-const policyService = ctx.get('sandboxPolicy')
-assert.ok(policyService !== undefined, 'the fixture must mount sandboxPolicy')
-const sandboxMode = policyService.resolve().mode
+/** 进程是否还活着：0 号信号只探存在性，不投递。 */
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
 
 /**
- * 发起本次 run 的主 agent（design.md §5.1）：阶段 2 起 `run_program` 要求归属明确，驱动得像
- * 真实链路一样给一个发起者。形态照 `packages/workflow/workflow-ptc/tests/setup.ts` 的 `fakeParent`：
- * 真 Session（cwd 取部署兜底，与阶段 1 无发起者时的解析结果一致）+ 最小 Agent 面。
+ * 轮询等到这些文件都存在（脚本自己写 pid 文件，比"猜它起了没有"可靠）。
+ * @param paths - 待出现的绝对路径。
+ * @param timeoutMs - 等待上界。
  */
-const sessions = ctx.get('sessions')
-assert.ok(sessions !== undefined, 'the fixture must mount the session store')
-const initiatorSession = sessions.create(undefined, { meta: { cwd: policyService.resolve().workspaceRoot } })
-const initiator = { id: initiatorSession.id, session: initiatorSession, options: {} } as unknown as Agent
+async function waitForFiles(paths: readonly string[], timeoutMs: number): Promise<void> {
+  const deadlineAt = Date.now() + timeoutMs
+  while (paths.some(path => !existsSync(path))) {
+    if (Date.now() > deadlineAt) throw new Error(`timed out waiting for ${paths.join(', ')}`)
+    await delay(50)
+  }
+}
 
 try {
   assert.ok(
-    ctx.tools.schemas().some(tool => tool.name === 'execution_engine_ping'),
-    'execution_engine_ping is not registered',
-  )
-  const ping = await ctx.tools.execute({
-    signal: new AbortController().signal,
-    callId: ToolCallId('execution-engine-skeleton'),
-    name: 'execution_engine_ping',
-    arguments: {},
-  })
-  assert.equal(ping.isError, false)
-  const pingText = ping.content.filter(block => block.type === 'text').map(block => block.text).join('')
-  assert.equal(pingText, 'ExecutionEngine skeleton is mounted: dsh-execution-engine phase 0.')
-
-  assert.ok(
     ctx.tools.schemas().some(tool => tool.name === 'run_program'),
     'run_program is not registered',
+  )
+  assert.ok(
+    ctx.tools.schemas().some(tool => tool.name === 'cancel_program'),
+    'cancel_program is not registered',
+  )
+  // 阶段 3 的模型面就是这两个：不给任何读取工具（phase3-plan §11 Q1 裁决丙）。
+  assert.deepEqual(
+    ctx.tools.schemas().map(tool => tool.name).filter(name => name === 'job_output' || name === 'job_list' || name === 'job_kill'),
+    [],
+    'the generic job tools must not be mounted: they would widen the model surface past design.md §6.4',
   )
 
   // `.d.ts` 系统提示段：模型写程序时的唯一依据，必须在装配结果里。
@@ -174,14 +299,14 @@ try {
   const sdk = assembly.sections.find(section => section.name === 'execution-engine-sdk')
   assert.ok(sdk !== undefined, 'the execution-engine-sdk prompt section is not registered')
   assert.equal(sdk.interpolate, false, 'the SDK text must not be interpolated')
-  for (const declaration of ['declare function dispatchsubagent(', 'declare function process(', 'declare function processOrThrow(', 'flow.tmpDir', 'declare const console']) {
+  for (const declaration of ['declare function dispatchsubagent(', 'declare function process(', 'declare function processOrThrow(', 'flow.tmpDir', 'declare const console', 'cancel_program']) {
     assert.ok(sdk.text.includes(declaration), `the SDK section must declare ${declaration}`)
   }
 
   // ---- B0：没有发起者的调用大声失败（两个组合共有） ---------------------------
   // `ToolRunContext.agent` 是可选字段，所以 `host/index.ts` 自己判空；它是生产上唯一会触发那句
   // 错误的地方（binding 的 `parent` 是必填，缺席在类型层不可表达），只有真装配跑得出来。
-  const noAgent = await callRunProgramWithoutAgent('return 1')
+  const noAgent = textOf(await callRunProgram('return 1'))
   assert.match(
     noAgent,
     /requires an initiating agent/,
@@ -189,9 +314,17 @@ try {
   )
   process.stdout.write('B0 run_program without an initiating agent fails loud: OK\n')
 
+  // ---- B8：没有程序在跑时取消是正常返回（两个组合共有，且必须在别的用例之前） --------
+  const idleCancel = await callCancelProgram(initiator)
+  assert.equal(idleCancel.isError, false, 'cancelling with nothing running must not be a tool failure')
+  const idleCancelValue = idleCancel.value as { cancelled: boolean }
+  assert.equal(idleCancelValue.cancelled, false)
+  assert.match(textOf(idleCancel), /当前没有正在运行的程序/)
+  process.stdout.write('B8 cancel_program with nothing running returns normally: OK\n')
+
   if (sandboxMode === 'danger-full-access') {
     // ---- B1：程序能跑，process 真的执行外部程序 -------------------------------
-    const b1 = await callRunProgram(`
+    const b1 = await runToCompletion(`
 const r = await process(['python', '-c', 'print("EE_OK")'])
 return { ok: r.code === 0 && r.stdout.trim() === 'EE_OK', code: r.code, out: r.stdout.trim() }
 `)
@@ -199,15 +332,31 @@ return { ok: r.code === 0 && r.stdout.trim() === 'EE_OK', code: r.code, out: r.s
     assert.deepEqual(returned(b1), { ok: true, code: 0, out: 'EE_OK' })
     process.stdout.write('B1 run_program + process: OK\n')
 
+    // ---- B1b：工具立刻返回，不等程序跑完 --------------------------------------
+    // 程序自己 sleep 4s；工具必须显著更早返回。差值取得足够大，慢机器上也不会 flaky
+    // （phase3-plan R6）。
+    const b1b = await startProgram(`
+await process(['python', '-c', 'import time; time.sleep(4)'])
+return 'EE_SLOW_DONE'
+`)
+    assert.ok(
+      b1b.elapsedMs < 2_000,
+      `B1b: run_program took ${String(b1b.elapsedMs)}ms — it waited for the program instead of returning`,
+    )
+    const b1bOutput = await jobOutput(b1b.jobId)
+    assertProgramSucceeded(b1bOutput, 'B1b')
+    assert.equal(returned(b1bOutput), 'EE_SLOW_DONE', 'the background program must still have run to completion')
+    process.stdout.write(`B1b run_program returns immediately: OK (returned in ${String(b1b.elapsedMs)}ms)\n`)
+
     // ---- B2：非零退出码正常返回、processOrThrow 抛出、超时生效 ----------------
-    const b2a = await callRunProgram(`
+    const b2a = await runToCompletion(`
 const r = await process(['python', '-c', 'import sys; sys.exit(3)'])
 return { code: r.code, timedOut: r.timedOut, stderr: r.stderr }
 `)
     assertProgramSucceeded(b2a, 'B2a')
     assert.equal((returned(b2a) as { code: number }).code, 3, 'a non-zero exit code must be returned normally')
 
-    const b2b = await callRunProgram(`
+    const b2b = await runToCompletion(`
 try {
   await processOrThrow(['python', '-c', 'import sys; sys.exit(3)'])
   return { threw: false }
@@ -221,7 +370,7 @@ try {
     assert.match(String(thrown.message), /exited with code 3/)
 
     const timeoutStart = Date.now()
-    const b2c = await callRunProgram(`
+    const b2c = await runToCompletion(`
 const r = await process(['python', '-c', 'import time; time.sleep(30)'], { timeoutMs: 1000 })
 return { timedOut: r.timedOut, code: r.code }
 `)
@@ -236,7 +385,7 @@ return { timedOut: r.timedOut, code: r.code }
 
     // ---- B3：超上限在解析期被拒，且没有启动任何进程 ---------------------------
     const b3Sentinel = join(scratch, 'b3-started.txt')
-    const b3 = await callRunProgram(`
+    const b3 = await runToCompletion(`
 try {
   await process(
     ['python', '-c', 'import pathlib,sys; pathlib.Path(sys.argv[1]).write_text("started")', ${JSON.stringify(b3Sentinel)}],
@@ -273,7 +422,7 @@ try {
     ].join('\n'))
 
     const b4Start = Date.now()
-    const b4 = await callRunProgram(`
+    const b4 = await runToCompletion(`
 const r = await process(
   ['python', ${JSON.stringify(forkerScript)}, ${JSON.stringify(b4Sentinel)}, ${JSON.stringify(orphanScript)}],
   { timeoutMs: 1000 },
@@ -297,7 +446,7 @@ return { timedOut: r.timedOut }
     // 判据 1 + 4：程序里两次 `dispatchsubagent` 各拿回脚本化 provider 的固定文本，而该 provider
     // 之所以被调用，是因为 fixture 把 `subagentProvider` 配成了 `scripted`——配错成没注册的名字时
     // `ctx.subagents.start` 会直接拒绝，这段程序会以失败小节收场，下面第一条断言就会拦住。
-    const b6 = await callRunProgram(`
+    const b6 = await runToCompletion(`
 const first = await dispatchsubagent('scripted one')
 const second = await dispatchsubagent('scripted two')
 return { first, second }
@@ -323,7 +472,7 @@ return { first, second }
 
     // 判据 5：子 agent 非正常完成时抛出，且消息里带上 reason 与 provider 写的诊断
     // （phase2-plan §9 Q1；诊断是有意的信息通道，见 packages/subagent/subagent/src/types.ts:288-294）。
-    const b6Failure = await callRunProgram(`
+    const b6Failure = await runToCompletion(`
 try {
   await dispatchsubagent(${JSON.stringify(`${FAILURE_MARKER} this one must fail`)})
   return { threw: false }
@@ -342,6 +491,109 @@ try {
     )
     assert.equal(scriptedStarts().length, 3, 'the failing dispatch must still have reached the provider')
     process.stdout.write('B6 non-completed child throws with its reason and diagnostic: OK\n')
+
+    // ---- B7：单例 -------------------------------------------------------------
+    // A 会睡 60s，只有在"真的后台跑"的前提下才可能撞上单例。
+    const b7a = await startProgram(`
+await process(['python', '-c', 'import time; time.sleep(60)'])
+return 'A_FINISHED'
+`)
+    const b7Refusal = await callRunProgram('return "B"', initiator)
+    assert.equal(b7Refusal.isError, true, 'a second program must be refused while one is running')
+    const refusalText = textOf(b7Refusal)
+    assert.match(refusalText, /已经有一个程序在跑/, `the refusal must explain the singleton:\n${refusalText}`)
+    assert.ok(
+      refusalText.includes(b7a.jobId),
+      `the refusal must name the job that is already running:\n${refusalText}`,
+    )
+
+    // 取消 A：返回的那一刻，A 的临时目录已经删掉。
+    const b7Cancel = await callCancelProgram(initiator)
+    assert.equal(b7Cancel.isError, false, `cancelling A failed: ${textOf(b7Cancel)}`)
+    const b7CancelValue = b7Cancel.value as { cancelled: boolean; jobId?: string; status?: string }
+    assert.equal(b7CancelValue.cancelled, true)
+    assert.equal(b7CancelValue.jobId, b7a.jobId)
+    assert.deepEqual(liveRunDirs(), [], 'B7: cancelling A must have removed its run temporary directory')
+
+    // A 结算之后可以立刻启动 B，不会出现两个并存。
+    const b7b = await startProgram('return "B_OK"')
+    const b7bOutput = await jobOutput(b7b.jobId)
+    assertProgramSucceeded(b7bOutput, 'B7-b')
+    assert.equal(returned(b7bOutput), 'B_OK')
+    assert.deepEqual(liveRunDirs(), [], 'B7: B must have cleaned up after itself too')
+    process.stdout.write('B7 singleton refusal, cancel, and immediate restart: OK\n')
+
+    // ---- B9：取消等清理真正完成 -----------------------------------------------
+    // 程序 await 一个 fork 了子进程并睡 30s 的 process；取消它，然后在**返回的那一刻**看两个进程。
+    // 这是 design.md §4.4 "等到清理真正完成才返回"唯一能被观察到的形态：等的是 job 的 `done`，
+    // 而 `done` 在 runProgram 的 finally（先 drain 在飞的外部执行、再删临时目录）之后才 resolve。
+    const b9Sentinel = join(scratch, 'b9-orphan.txt')
+    const b9ParentPid = join(scratch, 'b9-parent.pid')
+    const b9ChildPid = join(scratch, 'b9-child.pid')
+    const b9OrphanScript = join(scratch, 'b9-orphan.py')
+    const b9ForkerScript = join(scratch, 'b9-forker.py')
+    // argv: sentinel=1, 自己的 pid 文件=2
+    writeFileSync(b9OrphanScript, [
+      'import os, pathlib, sys, time',
+      'pathlib.Path(sys.argv[2]).write_text(str(os.getpid()))',
+      'time.sleep(3)',
+      'pathlib.Path(sys.argv[1]).write_text("alive")',
+      '',
+    ].join('\n'))
+    // argv: sentinel=1, orphan 脚本=2, 自己的 pid 文件=3, 子进程 pid 文件=4
+    writeFileSync(b9ForkerScript, [
+      'import os, pathlib, subprocess, sys, time',
+      'pathlib.Path(sys.argv[3]).write_text(str(os.getpid()))',
+      'subprocess.Popen([sys.executable, sys.argv[2], sys.argv[1], sys.argv[4]])',
+      'time.sleep(30)',
+      '',
+    ].join('\n'))
+
+    const b9 = await startProgram(`
+const r = await process([
+  'python', ${JSON.stringify(b9ForkerScript)}, ${JSON.stringify(b9Sentinel)},
+  ${JSON.stringify(b9OrphanScript)}, ${JSON.stringify(b9ParentPid)}, ${JSON.stringify(b9ChildPid)},
+])
+return r.code
+`)
+    assert.equal(b9.status, 'running')
+    await waitForFiles([b9ParentPid, b9ChildPid], 20_000)
+    const b9Parent = Number(readFileSync(b9ParentPid, 'utf8'))
+    const b9Child = Number(readFileSync(b9ChildPid, 'utf8'))
+    assert.ok(processAlive(b9Parent) && processAlive(b9Child), 'B9: the process tree must be alive before the cancel')
+
+    const b9Cancel = await callCancelProgram(initiator)
+    assert.equal(b9Cancel.isError, false, `cancelling the B9 program failed: ${textOf(b9Cancel)}`)
+
+    // 返回的**这一刻**：两个进程都不在了，临时目录也删了。
+    assert.equal(processAlive(b9Parent), false, 'B9: the forked parent outlived the cancel return')
+    assert.equal(processAlive(b9Child), false, 'B9: the forked descendant outlived the cancel return')
+    assert.deepEqual(liveRunDirs(), [], 'B9: the cancel return must come after the temporary directory is gone')
+    // 后备：3s 后本该写出的哨兵始终没有出现（进程树真的被清了，而不是只剩一个空壳 pid）。
+    await delay(5_000)
+    assert.equal(existsSync(b9Sentinel), false, 'B9: the forked descendant survived the cancel')
+    process.stdout.write('B9 cancel waits for the process tree and temporary directory: OK\n')
+
+    // ---- B10：job owner 生命周期 ----------------------------------------------
+    // 用一个单独的发起者，免得把 initiator 用掉之后后面的用例没法跑。
+    const retiring = await makeAgent('retiring')
+    const b10 = await startProgram(`
+await process(['python', '-c', 'import time; time.sleep(60)'])
+return 'never'
+`, retiring.agent)
+    assert.equal(b10.status, 'running')
+
+    // 用户关掉会话 = 发起 agent 的 scope 被 dispose。注册表的契约是"owner disposal 取消并 await
+    // 这个 job"（packages/jobs/jobs/src/types.ts:56-62），所以 dispose 返回时清理已经完成。
+    await retiring.scope.dispose()
+
+    assert.deepEqual(liveRunDirs(), [], 'B10: disposing the owner must leave no run temporary directory')
+    assert.throws(
+      () => ctx.jobs.get(b10.jobId as unknown as JobId, retiring.agent),
+      /unknown job/,
+      'B10: the owner disposal must have removed the job record',
+    )
+    process.stdout.write('B10 job owner disposal cancels and awaits the program: OK\n')
   } else {
     // ---- B5：受限组合——工作目录外的写被策略拒绝，工作目录内的写成功 -----------
     // 两条用例在同一个程序、同一个 `process` 绑定、同一份策略下跑同一段 python 脚本，
@@ -370,7 +622,7 @@ try {
 
     // 前提：受限组合下 `process` 能起外部程序。边界断言在"这条路根本走不通"时没有意义，
     // 这一条先把"受限组合跑不起来"和"边界没生效"分开。
-    const preflight = await callRunProgram(`
+    const preflight = await runToCompletion(`
 const r = await process(['python', '-c', 'print("EE_OK")'])
 return { code: r.code, out: r.stdout.trim(), stderr: r.stderr.slice(-200) }
 `)
@@ -439,7 +691,7 @@ return { code: r.code, out: r.stdout.trim(), stderr: r.stderr.slice(-200) }
       'print("EE_B5_WROTE", flush=True)',
     ].join('\n')
 
-    const b5 = await callRunProgram(`
+    const b5 = await runToCompletion(`
 const python = ${JSON.stringify(python)}
 const targets = ${JSON.stringify({ outside: outsideTarget, inside: insideTarget })}
 async function attempt(path) {
