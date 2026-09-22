@@ -4,7 +4,7 @@
 
 本文档是 ExecutionEngine 插件的设计依据。所有产物先放在 `Workspace/` 下，确认可用后再集成进 DSH 本体。
 
-状态：设计已冻结。实现进度见 §12；阶段 0（骨架）已完成。
+状态：设计已冻结。实现进度见 §12，阶段 0–7 已全部落地（**尚欠阶段 6 的 GIF**，见 §12 阶段 6 与阶段 7 的补记）；§13 的七项待定已在阶段 7 结清。
 
 ## 1. 目标与动机
 
@@ -564,15 +564,56 @@ interface ProcessOutput {
 
 **验证**：全量测试通过；文档与实现一致。
 
-## 13. 待定（实现层，非设计决策）
+**本阶段的交付与验收落点（阶段 7 实现时补记）**：
 
-1. **包怎么拆**：工具包 / 引擎包 / 客户端包，依赖方向。
-2. **`flow/*` 事件清单**：UI 要从事件推导面板与按钮状态，先定字段。
-3. **`.d.ts` 与提示词的生成方式**：手写固定文本，还是照 `jsonSchemaToTs` 那套生成。
-4. **`flow.tmpDir` 的最终命名与暴露形态**。
-5. **测试范围**：至少覆盖单例、取消、归属随主 agent 死、超时封顶、未投递 report 作废。
-6. **面板形态**：源码如何滚动跟随当前行、轨迹保留多少条、`report` 与轨迹是否分区展示。
-7. **行号映射的可靠性**：先确认 guest 里程序的求值方式（`vm` / `new Function` / 临时文件），再决定走 stack 取行号还是 AST 变换（§8.3）。
+- **交付**：`README.md`（含「回归测试覆盖」与「搬进 `packages/` 时要做什么」两节）；A 档新增
+  `tests/routes.spec.ts`（7 条）与 `tests/tmp-dir.spec.ts` 的清理失败用例（补的是 §13 第 5 条没列、
+  但审计认为该有的两处）；§13 七项结清（见下）。
+- **A 档（本会话跑过）**：`pnpm run typecheck`、`pnpm run test`（90 条全绿）、`pnpm run build`、
+  `node --check lib/client.js`，以及 `lib/client.js` 里模块 id 与 locale 键的断言。
+- **B/C 档的判据在开发过程中每个阶段都由负责人执行并全部通过**（B0–B14b、两份 fixture、C 档含三条 curl 路由判据）；
+  命令与逐条判据写在 README 的「验证」一节，可随时复跑。
+- **由委派 subagent 执行时跑不了**：subagent 会话的沙箱挡住的是 `tsx` 内部 **esbuild service worker 的管道子进程**
+  （`spawn EPERM`，落在 `startSyncServiceWorker`），**不是 `tsx` 本身**——`node --import tsx/esm -e "console.log('TSX_OK')"`
+  在同一个沙箱里通过，仓库根也装了 `node_modules/tsx`；C 档还额外要能驱动浏览器。负责人这一层有升级通道，
+  所以这两档不存在"没人跑过"。
+- **GIF 仍未产出**：阶段 6 记的原因不变，必须在能跑 C 档并能驱动浏览器的环境里按 `record-browser-gif` 补录。
+- **迁移未执行**：本阶段只产出方案，见 §13 第 1 条与 README 的对应一节。
+- **§6.4 末尾留的"生产者侧退出开关"本阶段没有做**：它要动 `packages/`（让 `JobStart` 能声明不投递完成通知），
+  超出本阶段"只碰 `Workspace/ExecutionEngine/`"的边界。默认部署下的实际行为（`tool-jobs` 仍会唤醒一次、
+  模型仍能用三个通用 job 工具）记在 README 的「已知限制」里，作为一条如实的账。
+
+## 13. 待定项的结论（阶段 7 结清）
+
+七项逐项结清。结论给在这里，逐条证据与可执行步骤在 `README.md` 里。
+
+1. **包怎么拆** —— 现在保持扁平（`host/` / `client/` / `shared/`）；搬进 `packages/` 时按**一个双面包**
+   `@deepseek-ai/dsh-execution-engine`（host 半边 + client 半边 + `src/protocol.ts`）落地，**不**按
+   engine / tool / client 三包拆。理由：client 半边要用 `STATE_PATH` / `CANCEL_PATH` 这两个**值**，而仓库禁止
+   feature plugin 之间的 runtime value import，拆开就得复制协议模块。先例 `packages/client/file-upload`。
+   逐个文件要改什么见 README 的「搬进 `packages/` 时要做什么」。
+2. **`flow/*` 事件清单** —— 定五个：`flow/start`（`runId` / `label` / `ownerSession` / `code`）、
+   `flow/call-start`（`callId` / `member` / `line` / `args` / `argsTruncated`）、
+   `flow/call-end`（`callId` / `ms` / `outcome` / `result` 或 `error` / `synthetic?`）、
+   `flow/report`（`text`）、`flow/end`（`status` / `discarded` / `detail?`）。字段的事实来源是
+   `host/flow-events.ts`，唯一消费者是 `host/flow-state.ts` + `client/panel.tsx`；成对承诺是 `(runId, callId)`，
+   程序在调用结算前终止时由宿主补发一条 `synthetic` 的 `end`（先于 `flow/end`）。
+3. **`.d.ts` 与提示词的生成方式** —— 手写固定文本 `sdkText(timeouts)`（`host/sdk.ts`），**不用 `jsonSchemaToTs`**：
+   那套生成器描述的是注册表里的工具，而这里程序看到的 API 是函数与一个 `flow` 命名空间，没有 JSON Schema 可依。
+   正文里的两个超时数字取自**已解析**的配置，所以部署改了 Config 之后模型看到的文档跟着变。
+4. **`flow.tmpDir` 的命名与暴露形态** —— 就是 `flow.tmpDir`（只读字符串），落点是
+   `<会话工作目录>/.execution-engine/<runId>`，引擎创建、run 结束时整体删除（`host/tmp-dir.ts`）。
+   不在 `os.tmpdir()` 下：受管期的可写范围就是工作目录，`process` 起的子进程与 PTC 子进程各有各的私有临时目录，
+   工作目录是唯一的可写交集——§3.4 的取值约定要求"外部脚本写、程序读"落在同一个位置。
+5. **测试范围** —— 六条要求逐条找到证据，缺的两处本次补上；另列出 §13 没列但审计认为该有的面，与"只有 B/C 档覆盖"
+   的清单。全部在 README 的「回归测试覆盖（§13 第 5 条的审计结论）」一节。
+6. **面板形态** —— 定了：轨迹与 report 各自有界保留（`MAX_CALLS` 200 / `MAX_REPORTS` 50）、
+   源码超过 `CODE_MAX_LINES` 400 行时只渲染当前行上下 `CODE_WINDOW_RADIUS` 150 行的一段、
+   宿主补发的闭合显式标记（`trace.synthetic`「宿主补发」）、当前行是轨迹里**最后一条**还开着的调用所在行。
+   `report` 与轨迹分区展示（是）。**未做**：虚拟滚动；用开窗代替了"源码滚动跟随当前行"。
+7. **行号映射的可靠性** —— 定了：`new Error().stack` + `lineOffset: -1`。用户源码以 JSON 字面量嵌入、拼接时
+   一行都不动（`host/capabilities.ts` 的 `stripUserProgram` 只删类型），所以栈里的行号就是用户源码行号，
+   循环里同一行重复出现也照发不去重。**AST 变换（plan B）未启用**。
 
 ## 14. 参考
 

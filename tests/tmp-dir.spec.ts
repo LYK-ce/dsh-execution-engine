@@ -24,6 +24,31 @@ test('run 临时目录建在会话工作目录下', async () => {
   }
 })
 
+/**
+ * 清理失败只记一条告警，不抛出：run 的结论早已定下，删除失败是残渣，不该改写它
+ * （`host/engine.ts` 的 `finally` 里 `removeRunTmpDir` 的返回值没人看）。
+ *
+ * 失败现场用一个**真实但不可用**的路径造：单个路径分量超过任何主流文件系统的上限，
+ * `rm` 的 `force` 只吞 ENOENT，吞不掉 ENAMETOOLONG；这样不必依赖 Windows 的文件占用语义。
+ */
+test('清理失败只记一条告警，不抛出', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'ee-tmp-dir-'))
+  const warnings: string[] = []
+  try {
+    const unreachable = join(cwd, 'x'.repeat(40_000))
+    await removeRunTmpDir(unreachable, message => { warnings.push(message) })
+
+    assert.equal(warnings.length, 1, 'a failed cleanup must warn exactly once')
+    assert.match(
+      warnings[0] ?? '',
+      /^execution-engine: could not remove the run temporary directory /,
+      'the warning must name the plugin and the failed operation',
+    )
+  } finally {
+    await rm(cwd, { recursive: true, force: true })
+  }
+})
+
 /** 删除是整体的：run 目录连同它里面的东西一起消失，父目录留在原地。 */
 test('run 结束整体删除临时目录', async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'ee-tmp-dir-'))
