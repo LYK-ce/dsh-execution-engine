@@ -4,8 +4,8 @@
 **确定的步骤**（`process` / `processOrThrow`）跑外部程序，**汇报**（`report`）单向发回发起会话。
 程序在**后台 job** 里跑，不阻塞主 agent 的回合；每个会话同时只有一个（单例）。
 
-设计依据 [design.md](./design.md)；实施是阶段 0–7，每个阶段的方案与当时跑过的证据在
-[phase0-plan.md](./phase0-plan.md) … [phase7-plan.md](./phase7-plan.md)。文档风格照 [../Blackboard/README.md](../Blackboard/README.md)。
+设计依据 [design.md](./design.md)；实施是阶段 0–8，每个阶段的方案与当时跑过的证据在
+[phase0-plan.md](./phase0-plan.md) … [phase8-plan.md](./phase8-plan.md)。文档风格照 [../Blackboard/README.md](../Blackboard/README.md)。
 
 本目录是**独立的 git 仓库**，不是仓库根 workspace 的一部分：它自带 `pnpm-workspace.yaml`（自己就是 workspace root），
 host 半边靠 `--patch` overlay 挂上，客户端 bundle 由 `build/build-client.mjs` 自己打包。**没有改 `packages/` 的任何文件。**
@@ -22,7 +22,7 @@ host/            DSH 插件（host 半边）；源码启动，tsx 直接跑 .ts�
   flow-state.ts  flow/* 的宿主侧累加器：每会话「当前这一版 run」+ since 增量快照
   routes.ts      两条 exact Fetch route 的处理与 400 分支
   process-binding.ts      process / processOrThrow：过 ctx.sandbox.confine，超时后等受管范围静默
-  subagent-binding.ts     dispatchsubagent：parent = 发起的主 agent，dispose 在 finally
+  subagent-binding.ts     dispatchsubagent：parent = 发起的主 agent，可选 route 过策略校验，dispose 在 finally
   report-binding.ts       report：createUserMessage + followup，记账 MessageId 供取消作废
   guest-source.ts guest 外壳源码：vm context、能力面、原语包装、调用点行号
   capabilities.ts 外壳与用户源码的拼接；剥类型（行结构不变）
@@ -36,7 +36,7 @@ client/          浏览器半边，被打包成 lib/client.js
   locale.ts      en / zh 字典
 shared/          protocol.ts：两条路由的路径常量与线格式（两侧共用，无 @deepseek-ai/* import）
 build/           build-client.mjs：esbuild → lib/client.js（模块表 lazy-CJS 协议）
-tests/           11 个 node:test spec + loader-driver.ts（B 档驱动）+ fixtures/（两个 Loader 组合 + 脚本化 provider）
+tests/           12 个 node:test spec + loader-driver.ts（B 档驱动）+ fixtures/（两个 Loader 组合 + 脚本化 provider）
 execution-engine.cordis.yml  --patch overlay（只插一条 host 行）
 tsconfig.json / tsconfig.client.json   host / client 两个 noEmit program
 lib/             构建产物（本目录 .gitignore 覆盖）
@@ -93,7 +93,7 @@ run 级**没有**截止时间：程序天然长跑，加整体截止会误杀正
 
 ```ts
 declare const flow: { readonly tmpDir: string }
-declare function dispatchsubagent(prompt: string): Promise<string>
+declare function dispatchsubagent(prompt: string, opts?: { provider?: string; model?: string }): Promise<string>
 declare function process(argv: string[], opts?: ProcessOptions): Promise<ProcessResult>
 declare function processOrThrow(argv: string[], opts?: ProcessOptions): Promise<ProcessOutput>
 declare function report(text: string): Promise<void>
@@ -113,6 +113,29 @@ declare const console: { log(...): void; info(...): void; warn(...): void; error
 **vm 扣留是引导，不是安全边界**：实测可逃逸（`this.constructor.constructor('return process')()`，注入函数的
 `.constructor` 同样可达，加 `codeGeneration` 也堵不住），所以不为堵逃逸投入。写进 `.d.ts` 的措辞是"应当落在某目录内"，
 不是"已封死"。
+
+## 按调用指定子 agent 模型（阶段 8）
+
+```ts
+const review = await dispatchsubagent('review this diff', { provider: 'deepseek', model: 'deepseek-reasoner' })
+const plain = await dispatchsubagent('and summarize this')   // 沿用当前会话的模型
+```
+
+`provider` 与 `model` **必须一起给**：只给一个就在调用时抛出——只给 `model` 的那条**沿用** `list_subagent_models` 的同一句 `` `model` requires `provider` ``，外面加 `dispatchsubagent: ` 标明是哪个原语拒的（整条消息**不是**逐字一样的），而不是回落到"父 provider 下的这个 model"——那种回落会把失败推到程序看不见的下游。两个都不给就是阶段 2 的老语义：子 agent 继承父 agent 的路由（请求里连 `agentOptions` 这个键都不出现）。
+
+第二个参数**只认 `provider` 与 `model` 两个自有键**，出现别的键就在外壳里抛出（消息点名那个键、并说明本原语只接受这两个）。这不是"洁癖"：姊妹工具的模型字段叫 **`reasoning_effort`**（`packages/subagent/tool-subagent/src/model-selection.ts:65-69`），外壳若把它静静丢掉，程序会拿到**成功**、用的却是默认 effort，而绑定那一层根本看不到这个键——没有任何一层能报错，结果是静默的错误结果。
+
+**部署前提**：显式指定只有在部署挂了 `subagent-model-selection` 策略、且这对 route 落在它的 `allowedModels` 里时才成立。引擎读的是**同一份**策略（`ctx.get('subagentModelSelection')`），不自己维护白名单；策略缺席、没开启、清单为空、route 没命中，**一律拒绝显式指定**，错误里列出可用 route（一条都没有时是 `(none)`）。`subagent-model-selection-settings` 由 web-app bundle 挂（`packages/bundle/web-app/cordis.patch.yml:47`），所以这条能力由**部署**决定，不是程序能自己打开的。引擎不把这份策略放进 `inject`：缺席只该让"显式指定"被响亮地拒绝，不该让 headless 部署连 `run_program` 都不注册。
+
+**发现走主 agent 的 `list_subagent_models` 工具**：不带参数列 provider，带 `provider` 列它的 model。`.d.ts` 只指向它，**不抄目录**——目录随部署变化，抄进提示词就是一份迟早说谎的文档。
+
+引擎**不查**别的：不查 `ctx.llm` 的目录（`LlmModelInfo` 的目录成员资格是 advisory，不是请求校验），不查 provider 的能力位（`ctx.subagents.start` 自己会拒），也不查 `ctx.llm.listProviders()`——引擎**不注入 `ctx.llm`**。
+
+**不注入 `ctx.llm` 的代价**：策略里列了一个**没注册**的 provider 时，校验通过、`start` 也成功——`assertCapabilities` 只查能力位（`packages/subagent/subagent/src/index.ts:641-648`），`resolveChildAgentOptions` 只做父子路由合并（`packages/subagent/subagent/src/child-agent.ts:99-119`），都不查注册。子 agent 会话照建，**第一次模型请求**才在 LLM 适配器层炸：仍然响亮，但**晚了一整层**，措辞也是 provider 层的——`AgentOptions.provider` 的契约就是"call time 必须有注册的适配器"（`packages/core/agent/src/runtime-types.ts:26-35`）。真正的兜底在**发现侧**：`list_subagent_models` 的无参清单用 `listProviders()` 过滤（`packages/subagent/tool-subagent/src/list-models.ts:50-51`），未注册的 provider 根本不会出现；照 `.d.ts` 走、只用那份清单里的 id 的模型到不了那次晚失败。这条本身是**部署配置错误**，发现工具在带 `provider` 时会先一步抛出 `LLM provider "X" is not registered; available providers: …`（`packages/subagent/tool-subagent/src/list-models.ts:20-27`）。为这一次晚失败给引擎拉进第三个可选服务不划算，所以这个代价是**接受的**。
+
+与 `tool-subagent` 有一处**有意的差异**：那个工具在会话组合时**快照**策略（`packages/subagent/tool-subagent/src/list-models.ts:84` 的 `policy` 就是组合那一刻捕获的），引擎每次 `dispatchsubagent` 调用现读 `current()`。真原因是**引擎没有每会话组合点**：工具在插件加载时注册一次，而 run 是会话起来之后才有的；快照一份就等于策略改动之后引擎一直按旧的那份判，而校验的对象必须是**这一次调用**的参数。
+
+**后果**：设置在会话中途改动之后，`list_subagent_models` 广告的是它组合时快照的策略、引擎执行的是现读的策略，两者不一致时会出现"**广告了却被拒**"——快照里已经删掉的 route 还在广告，调用它被引擎拒绝；反过来刚加上的 route 能执行却没人广告。两个消费者读的是同一个服务的同一个方法，差的只是读的时刻。
 
 ## 模型看得见的两个工具
 
@@ -166,14 +189,14 @@ node --check lib/client.js
 Select-String -Path lib\client.js -Pattern 'dsh-execution-engine','view.panel','action.cancel'
 ```
 
-判据：前四条 exit 0，`pnpm run test` 全绿（当前 90 条），最后一条三个模式都命中。
+判据：前四条 exit 0，`pnpm run test` 全绿（当前 104 条），最后一条三个模式都命中。
 
-**本会话的 A 档真实输出**（阶段 7 执行时）：
+**本会话的 A 档真实输出**（阶段 8 执行时）：
 
 ```
 pnpm run typecheck                             exit 0（无诊断）
-pnpm run test                                  tests 90 / pass 90 / fail 0 / duration_ms 4418.9
-pnpm run build                                 lib\client.js  15.4kb   Done in 6ms
+pnpm run test                                  tests 104 / pass 104 / fail 0 / duration_ms 3759.1
+pnpm run build                                 lib\client.js  15.4kb   Done in 5ms
 node --check lib/client.js                     exit 0
 Select-String -Path lib\client.js -Pattern 'dsh-execution-engine','view.panel','action.cancel'
   client.js:1:  window.__ModuleLoader__.load({ id: "dsh-execution-engine", factory: (require) => {
@@ -181,9 +204,13 @@ Select-String -Path lib\client.js -Pattern 'dsh-execution-engine','view.panel','
   client.js:62: "action.cancel": "\u53D6\u6D88\u7A0B\u5E8F",
 ```
 
+阶段 7 那一轮的同一条命令是 90 条全绿；阶段 8 加上 14 条（`subagent-binding.spec.ts` 10 条、
+`vm-surface.spec.ts` 1 条、`sdk-text.spec.ts` 3 条）。
+
 ### B 档（真实 Loader 组合；需要 tsx）
 
 下面的判据在开发过程中**每个阶段都由负责人真跑过并全部通过**（B0–B14b、两份 fixture），可随时复跑。
+**B15 是阶段 8 新增的，尚未由负责人跑过**（写它的执行 agent 在会话沙箱里跑不了 tsx）。
 
 **委派 subagent 执行时会撞 EPERM**：被挡的不是 `tsx` 本身（`node --import tsx/esm -e "console.log('TSX_OK')"` 是过的，
 仓库根也装了 `node_modules/tsx`），而是它内部 **esbuild service worker 的管道子进程**——subagent 会话的沙箱不允许
@@ -196,7 +223,7 @@ node --import tsx/esm Workspace/ExecutionEngine/tests/loader-driver.ts Workspace
 ```
 
 判据：两条 exit 0，stdout 末尾 `LOADER_SMOKE_OK`，且每个用例各有一条 `: OK`。用例清单与逐条判据写在
-`tests/loader-driver.ts` 的文件头（B0–B14b），要点：
+`tests/loader-driver.ts` 的文件头（B0–B15），要点：
 
 | 用例 | 判据 |
 |---|---|
@@ -209,6 +236,7 @@ node --import tsx/esm Workspace/ExecutionEngine/tests/loader-driver.ts Workspace
 | B11 / B12 | `report` 按程序调用顺序投递、`source.plugin === 'execution-engine'`；取消后本次 run 未投递的三条被摘掉（`flow/end.discarded === 3`），上一次 run 留下的两条原封不动 |
 | B13 | `flow/call-start.line` 逐条等于程序里写死的行号（含循环里重复的同一行、失败调用也闭合）、`flow/start.code` 是提交正文，而内部 `trace` 不在程序可见面里 |
 | B14a / B14b | 两条 route 真的挂在 `ctx.connection.fetch` 上（含缺 `sessionId`、负 `since` 的 400）；面板状态与 `flow/*` 逐条一致、`since` 增量三种取值、经路由取消且返回时临时目录已删 |
+| B15（阶段 8） | 命中 `allowedModels` 的 route **逐字**到脚本化 provider 的 `agentOptions`；不填时请求里没有这个键（继承语义没变）；清单外的 route 抛出且消息里列出可用 route；只给 `model` 抛出且消息里含与 `list_subagent_models` 同一句 `` `model` requires `provider` `` |
 | B5（受限 fixture） | `process` 起的外部进程过发起会话的文件策略：写工作目录外被拒、写工作目录内成功（两条互补） |
 
 ### C 档（真 `dsh web`）
@@ -217,13 +245,13 @@ node --import tsx/esm Workspace/ExecutionEngine/tests/loader-driver.ts Workspace
 **委派 subagent 执行时同样跑不了**：既要真服务器、又要能驱动浏览器，subagent 会话两样都不具备。
 
 ```powershell
-$env:DSH_HOME = Join-Path $env:TEMP ('ee-p7-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+$env:DSH_HOME = Join-Path $env:TEMP ('ee-p8-' + [guid]::NewGuid().ToString('N').Substring(0,8))
 New-Item -ItemType Directory -Force -Path $env:DSH_HOME | Out-Null
 # cwd = 仓库根；端口用 3099，不要占 3080
 pnpm dsh web --patch Workspace/ExecutionEngine/execution-engine.cordis.yml --host 127.0.0.1 --port 3099 --no-open
 ```
 
-判据（1–4 是"挂上了"，5 是路由，6–7 要浏览器，8 是收尾）：
+判据（1–4 是"挂上了"，5 是路由，6–7 要浏览器，8 是收尾，9 是阶段 8 特有的一条）：
 
 1. stdout 打印监听地址，且 **stderr 没有 `did not activate` / `required startup failure`**。
 2. 浏览器打开根 URL 能出 shell，`__DSH_BOOT__` 里有 `dsh-execution-engine`。
@@ -248,6 +276,10 @@ pnpm dsh web --patch Workspace/ExecutionEngine/execution-engine.cordis.yml --hos
    面板出现程序正文与轨迹，循环里同一行反复出现。
 7. 点面板的「取消程序」→ 与 `cancel_program` 行为一致，run 变「已取消」，按钮回到可点状态。
 8. 跑完关掉服务并确认 3099 已释放。
+9. **阶段 8 特有**：这个组合里 `subagent-model-selection-settings` 是 web-app bundle 挂的（`packages/bundle/web-app/cordis.patch.yml:47`），但那一行**没有 config**，所以服务在场而策略是关闭的。两段判据：
+   - **默认状态**：让主 agent 派一个带 `{ provider, model }` 的子 agent，回来的是"列出可用 route"的错误，且清单是 `(none)`；
+   - **打开之后**：在 Plugins 设置页（或设置文档）把这个 namespace 打开并加一条 route，同一段程序再跑一次——命中的那条正常完成，没命中的那条错误里的清单变成刚配的那条。
+   这两段合起来才是"引擎读得到真实策略"的实证（B15 用的是 fixture 自己挂的同名服务，证不了真组合的挂载）。
 
 ### GIF
 
@@ -257,6 +289,9 @@ pnpm dsh web --patch Workspace/ExecutionEngine/execution-engine.cordis.yml --hos
 
 ## 已知限制
 
+- **仓库级 keyless 快照没产出（迁移欠账）**：`snapshots/AGENTS.md` 要求每个被测进程经 `dsh` CLI + 一个 shipped profile（+ 可选 scenario patch）启动，而本插件今天是 `--patch` overlay、不在任何 shipped profile 里，录制还要 key、产物要落 `snapshots/`——都在本插件的改动范围之外。本插件因此用**自己的 golden 断言**（`tests/sdk-text.spec.ts` 把 `.d.ts` 渲染文本逐字钉住）顶上，模型可见的三处（两个工具的 schema 与结果文本、`execution-engine-sdk` 段）都还没有仓库级录制会话。这一笔随**迁移**还：迁移后插件进了 shipped profile，那一次 PR 才录得出来（见「搬进 `packages/` 时要做什么」第 11 条）。
+- **显式指定子 agent 模型是部署能力，不是程序能力**：`allowedModels` 由用户设置维护、服务由 web-app bundle 挂。策略缺席、没开启或清单为空时，程序的 `dispatchsubagent(p, { provider, model })` 一律被拒（消息里 `available routes: (none)`）——引擎**没有**"没有策略就放行"的回落，那会把"部署授权"重新变成"调用方自己说了算"。
+- **`assertAllowedRoute` 把"缺席 / 未开启 / 空清单"归一成同一个空清单是故意的**：三者在引擎这一侧的后果完全相同——没有授权任何可选路由，拒绝消息一律是 `available routes: (none)`。其中 `enabled && allowedModels.length === 0` 这一路在**生产里不可达**：`subagent-model-selection-settings` 在加载与写入两侧都拒这种取值（`packages/subagent/tool-subagent/src/model-selection-settings.ts:92-97`）。保留它是因为引擎读的是 `ctx.get('subagentModelSelection')` 拿到的实现，不代上游断言"这条不会出现"。
 - **面板不可回放。** 数据走宿主侧累加器 + 轮询，不是会话事件：刷新页面要等下一拍（最多 1s）才恢复，而且看不到历史 run
   （累加器只留当前那一个）。`flow/*` 要落成 log-only 会话事件才能回放，那是另一量级的改动（要动 `SessionEventMap` 与持久化）。
 - **`report` 每条一次模型调用**，额度不由引擎管——报什么、报几次由程序自己掌握（攒到阶段边界再报是程序该有的纪律）。
@@ -279,7 +314,7 @@ pnpm dsh web --patch Workspace/ExecutionEngine/execution-engine.cordis.yml --hos
 | 面 | 导出 | 约束 |
 |---|---|---|
 | host 插件 | 恰好 `name` / `inject` / `Config` / `apply`，**没有 `default`** | Loader 的 `unwrapExports` 会取 `.default`，加了它会把 `inject` / `name` / `Config` 一起丢掉（postmortem 0001）。`tests/host-shape.spec.ts` 钉住这条 |
-| host `inject` | `['tools','jobs','ptcRuntime','subprocess','subagents','sandbox','systemPrompt']` | `sandboxPolicy` 与 `agents` 走 `ctx.get` 可选读；`connection` 走 `ctx.inject(['connection'], …)`，所以 headless 部署照样能跑程序 |
+| host `inject` | `['tools','jobs','ptcRuntime','subprocess','subagents','sandbox','systemPrompt']` | `sandboxPolicy`、`agents` 与 `subagentModelSelection` 走 `ctx.get` 可选读；`connection` 走 `ctx.inject(['connection'], …)`，所以 headless 部署照样能跑程序 |
 | client 插件 | `apply` / `inject`（`['slots','locale']`） | 业务组件、locale 字典、源实现都不导出；`build/build-client.mjs` 的模块表 id 必须等于包名 |
 
 ## 回归测试覆盖（§13 第 5 条的审计结论）
@@ -304,7 +339,8 @@ pnpm dsh web --patch Workspace/ExecutionEngine/execution-engine.cordis.yml --hos
 | `host/tmp-dir.ts` 的清理失败分支 | **本次补上**：`tests/tmp-dir.spec.ts` 新增 `清理失败只记一条告警，不抛出` |
 | `host/flow-state.ts` 的边界 | 已覆盖：`since 的四个边界：最新、增量、比最新还大、刚换过 run`、`有界：调用与 report 各自裁到上限，丢的是最旧的`、`有界挤掉了 start 时，那条迟到的 end 也不会补进来`、`没有 start 的事件被丢掉，没有配对的 call-end 也被丢掉`、`换一次 run 就换掉整份记录，上一次 run 的事件不再改动它`、`两个会话各记各的` |
 | `host/config.ts` | 已覆盖（8 条），含 schemastery 缺省常量与解析器同源那条源码级比对 |
-| `host/guest-source.ts` / `host/capabilities.ts` | 已覆盖：`guest-source.spec.ts` 8 条 + `vm-surface.spec.ts` 14 条（含包装层行号、trace 不外泄、预览有界） |
+| `host/guest-source.ts` / `host/capabilities.ts` | 已覆盖：`guest-source.spec.ts` 8 条 + `vm-surface.spec.ts` 15 条（含包装层行号、trace 不外泄、预览有界、程序给的 `opts` 过外壳、未知自有键被拒） |
+| 按调用指定子 agent 模型（阶段 8 新增面） | `subagent-binding.spec.ts` 10 条：合法 route 逐字转发且其余入参不变、不填时 `agentOptions` 这个键**不在场**、只给 model / 只给 provider / 空串 / 非字符串都抛且不产生 `start`、清单外抛且消息列出可用 route、策略缺席·未开启·空清单一律拒、策略每次调用现读、列表有界、已中止时给了路由也不 start。`.d.ts` 另有 `sdk-text.spec.ts` 的整段 golden | B15（命中 / 不填 / 清单外 / 只给 model 四段） |
 
 **只有 B 档能覆盖**，以及**目前哪一档都没有**的：
 
@@ -318,6 +354,8 @@ pnpm dsh web --patch Workspace/ExecutionEngine/execution-engine.cordis.yml --hos
 | `host/process-binding.ts` 的 `processOrThrow` **超时抛错** | **哪一档都没有**：B2b 只覆盖 `exited with code`；B2c 用的是 `process`（超时正常返回），B3 命中的是 spawn **之前**的解析期拒绝（`exceeds the configured maximum`），两条都不经过 `processOrThrow`。**可由 B 档补**，用例见本表之后的代码块 |
 | `client/` 全部 | C 档 + `lib/client.js` 的模块 id / locale 键断言。**A 档没有面板的行为测试**（要浏览器），`overlay.spec.ts` 只钉住入口文件名与 `dsh.client` / `exports["./client"]` 的一致性 |
 | 归属随主 agent 死的**子 agent** 那一层 | 本插件只负责把 `parent` 与同一个 run 信号递下去（B6 与 `subagent-binding.spec.ts` 的 abort 用例各证一半）；"子 agent 随 parent 被 dispose 而 drain"归 `packages/subagent` 的 lineage teardown，不在本插件里，因此本目录不测 |
+| `ctx.get('subagentModelSelection')` 在**真部署**里读得到 | **只有 C 档**（第 9 条）：那条策略由 web-app bundle 挂（`packages/bundle/web-app/cordis.patch.yml:47`，那一行没有 config，默认是关闭的），B15 验的是 fixture 自己挂的同名服务，证不了"真组合里这一行确实在、打开后确实生效" |
+| `host/guest-source.ts` 里 `opts` 的形状与自有键那两条拒绝 | A 档：`vm-surface.spec.ts` 的 `dispatchsubagent 的 provider / model 过外壳，未给的键不出现`。程序传 `42` 或数组当第二个参数、或传 `provider` / `model` 之外的自有键（例如 `reasoning_effort`）时外壳抛出，绑定根本收不到调用——这是外壳的边界，不是绑定的 |
 
 补 `processOrThrow` 超时抛错的 B 档用例（可直接粘进 `tests/loader-driver.ts`，接在 B2c 之后）：
 

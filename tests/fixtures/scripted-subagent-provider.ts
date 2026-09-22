@@ -3,7 +3,8 @@
  * `spawn`（那个真的在进程内起 agent，需要模型 route），让 B6 在 keyless 下也能跑。
  *
  * 它同时是归属断言的落点：每次 `start` 收到的 `parent` 都记下来，驱动拿发起者的
- * `SessionId` 逐字比对——不是"非空"那种弱断言。
+ * `SessionId` 逐字比对——不是"非空"那种弱断言。阶段 8 起同一个记录里还有 `agentOptions`，
+ * 那是"程序指定的子 agent 模型真的走到了执行缝上"唯一的观察点（B15）。
  *
  * 自建而不是复用 `packages/subagent/tool-subagent/tests/scripted-provider.ts`：那是别的包的
  * 测试内部件，跨目录引用既脆又越界。
@@ -11,6 +12,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import type { AgentOptions } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type {
@@ -40,21 +42,30 @@ export const FAILURE_MARKER = 'EE_SCRIPTED_FAIL'
  */
 export const FAILURE_DIAGNOSTIC = 'scripted subagent failure requested by the prompt'
 
-/** 一个脚本化 provider 不支持的 start 期能力都不声明，`start` 只认最普通的请求。 */
+/**
+ * 脚本化 provider 声明的 start 期能力。`agentOptions` 必须为真：阶段 8 起 `dispatchsubagent`
+ * 会把程序指定的路由包成 `agentOptions` 转发下来，而 service 的 `assertCapabilities`
+ * （`packages/subagent/subagent/src/index.ts:641-643`）会按能力位拒绝——不声明它，B15 连请求都收不到。
+ * 其余能力仍然不声明：这个替身不实现输出 schema、深度上限、工具过滤与人设。
+ */
 const CAPABILITIES: SubagentCapabilities = {
-  agentOptions: false,
+  agentOptions: true,
   outputSchema: false,
   depthLimit: false,
   toolFilter: false,
   persona: false,
 }
 
-/** 一次脚本化 `start` 收到的归属与 prompt。 */
+/** 一次脚本化 `start` 收到的归属、prompt 与路由。 */
 export interface ScriptedStart {
   /** 发起这次派发的主 agent id；归属断言比对的就是它。 */
   readonly parentId: SessionId
   /** `start` 收到的 prompt 正文。 */
   readonly prompt: string
+  /** `start` 收到的子 agent 选项；程序没显式指定路由时是 `undefined`。 */
+  readonly agentOptions: AgentOptions | undefined
+  /** 键**是否在场**：省略与显式 `undefined` 是两回事，"继承父 agent"靠的是省略。 */
+  readonly hasAgentOptions: boolean
 }
 
 /**
@@ -77,7 +88,7 @@ function promptText(prompt: readonly ContentBlock[]): string {
     .join('')
 }
 
-/** 只回固定文本、只记归属的 provider；不带任何真实模型调用。 */
+/** 只回固定文本、只记归属与路由的 provider；不带任何真实模型调用。 */
 class ScriptedSubagentProvider implements SubagentProvider {
   readonly name = PROVIDER_NAME
   readonly capabilities = CAPABILITIES
@@ -86,7 +97,12 @@ class ScriptedSubagentProvider implements SubagentProvider {
   start(request: ResolvedSubagentStartRequest): Promise<SubagentRun> {
     request.signal.throwIfAborted()
     const prompt = promptText(request.prompt)
-    starts.push({ parentId: request.parent.id, prompt })
+    starts.push({
+      parentId: request.parent.id,
+      prompt,
+      agentOptions: request.agentOptions,
+      hasAgentOptions: Object.hasOwn(request, 'agentOptions'),
+    })
     const result: SubagentResult = prompt.includes(FAILURE_MARKER)
       ? { output: [], stopReason: 'error', diagnostic: FAILURE_DIAGNOSTIC }
       : { output: [{ type: 'text', text: SCRIPTED_REPLY }], stopReason: 'completed' }

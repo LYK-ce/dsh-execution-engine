@@ -1,18 +1,24 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentOptions } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { PtcBindingFunction } from '@deepseek-ai/dsh-ptc-runtime'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { SubagentResult, SubagentRun, SubagentRuntime, SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
 import { createSubagentBindings } from '../host/subagent-binding.ts'
+import type { SubagentModelSelection } from '../host/subagent-binding.ts'
 
-/** 一次脚本化 `start` 收到的请求摘录；归属与 provider 断言比对的就是这几项。 */
+/** 一次脚本化 `start` 收到的请求摘录；归属、prompt 与显式路由断言比对的就是这几项。 */
 interface StartRecord {
   readonly provider: string
   readonly prompt: ContentBlock[]
   readonly parent: Agent
+  readonly signal: AbortSignal
+  /** 请求里的 `agentOptions`；程序没显式指定路由时缺席。 */
+  readonly agentOptions: AgentOptions | undefined
+  /** 键**是否在场**：省略与显式 `undefined` 是两回事，继承语义靠的是省略。 */
+  readonly hasAgentOptions: boolean
 }
 
 /** 脚本化子 agent 执行缝：记录每次 `start`，返回给定的 run。 */
@@ -48,7 +54,14 @@ function scriptedSubagents(next: (record: StartRecord) => SubagentRun): FakeSuba
   const starts: StartRecord[] = []
   const runtime = {
     start(provider: string, request: SubagentStartRequest): Promise<SubagentRun> {
-      const record: StartRecord = { provider, prompt: request.prompt, parent: request.parent }
+      const record: StartRecord = {
+        provider,
+        prompt: request.prompt,
+        parent: request.parent,
+        signal: request.signal,
+        agentOptions: request.agentOptions,
+        hasAgentOptions: Object.hasOwn(request, 'agentOptions'),
+      }
       starts.push(record)
       return Promise.resolve(next(record))
     },
@@ -56,18 +69,36 @@ function scriptedSubagents(next: (record: StartRecord) => SubagentRun): FakeSuba
   return { runtime: runtime as unknown as SubagentRuntime, starts }
 }
 
+/**
+ * 一份固定的路由策略。默认开启并列出给定 route——`enabled` / 空清单两支由用例自己传。
+ * @param allowedModels - 允许显式选择的路由。
+ * @param enabled - 策略是否开启。
+ * @returns 每次调用都交回同一份策略的访问器。
+ */
+function selectionOf(
+  allowedModels: readonly { provider: string; model: string }[],
+  enabled = true,
+): () => SubagentModelSelection {
+  return () => ({ enabled, allowedModels })
+}
+
+/** 本 spec 的样例 route；`MODEL_SELECTION` 与它一致。 */
+const ROUTE = { provider: 'route-provider', model: 'route-model' }
+
 /** 一次 binding 调用要用的装配参数。 */
 interface BindingOptions {
   readonly subagents: SubagentRuntime
   /** 发起者；省略表示用 {@link PARENT}——binding 的入参是必填，缺席在类型层就不可表达。 */
   readonly parent?: Agent
   readonly signal?: AbortSignal
+  /** 路由策略访问器；省略表示这个部署没有挂策略服务。 */
+  readonly modelSelection?: () => SubagentModelSelection | undefined
   readonly warnings?: string[]
 }
 
 /**
  * 组装一份 `flow` 绑定。
- * @param options - 子 agent 执行缝、发起者、取消信号与告警收集器。
+ * @param options - 子 agent 执行缝、发起者、取消信号、路由策略与告警收集器。
  * @returns 注册进 PTC 绑定命名空间的那份函数表。
  */
 function bindingsFor(options: BindingOptions): Record<string, PtcBindingFunction> {
@@ -76,6 +107,7 @@ function bindingsFor(options: BindingOptions): Record<string, PtcBindingFunction
     provider: 'scripted',
     signal: options.signal ?? new AbortController().signal,
     subagents: options.subagents,
+    modelSelection: options.modelSelection ?? (() => undefined),
     warn: (message: string) => { options.warnings?.push(message) },
   })
 }
@@ -83,27 +115,34 @@ function bindingsFor(options: BindingOptions): Record<string, PtcBindingFunction
 /**
  * 调一次 `dispatchsubagent`。
  * @param bindings - `flow` 命名空间。
- * @param prompt - 程序传进来的那个参数值。
+ * @param prompt - 程序传进来的 prompt 参数值。
+ * @param route - 程序传进来的可选路由字段；省略就是没给第二个参数。
  * @returns binding 的完成值。
  */
 async function dispatch(
   bindings: Record<string, PtcBindingFunction>,
   prompt: unknown,
+  route?: { provider?: unknown; model?: unknown },
 ): Promise<unknown> {
   const binding = bindings.dispatchsubagent
   assert.ok(binding !== undefined, 'the flow namespace must expose dispatchsubagent')
-  return await binding({ prompt })
+  return await binding({ prompt, ...route })
 }
 
 /**
  * 调一次 `dispatchsubagent` 并把抛出物拿回来，供逐字段断言用。
  * @param bindings - `flow` 命名空间。
- * @param prompt - 程序传进来的那个参数值。
+ * @param prompt - 程序传进来的 prompt 参数值。
+ * @param route - 程序传进来的可选路由字段。
  * @returns 抛出的错误。
  */
-async function failureOf(bindings: Record<string, PtcBindingFunction>, prompt: unknown): Promise<Error> {
+async function failureOf(
+  bindings: Record<string, PtcBindingFunction>,
+  prompt: unknown,
+  route?: { provider?: unknown; model?: unknown },
+): Promise<Error> {
   try {
-    await dispatch(bindings, prompt)
+    await dispatch(bindings, prompt, route)
   } catch (error: unknown) {
     assert.ok(error instanceof Error, 'dispatchsubagent must throw an Error')
     return error
@@ -134,6 +173,162 @@ test('provider 名与父 agent 原样透传', async () => {
   assert.equal(start.provider, 'scripted', 'the configured provider name must reach ctx.subagents')
   assert.equal(start.parent, PARENT, 'the initiating agent must be the one and only parent')
   assert.deepEqual(start.prompt, [{ type: 'text', text: 'p' }])
+})
+
+// ---- 阶段 8：按调用指定子 agent 模型 ------------------------------------------
+
+/**
+ * 不填路由时**省略** `agentOptions`——不是 `undefined`，是键不在场。
+ * 继承父 agent 的路由就是靠这一次省略（`child-agent.ts:99-120` 的合并语义），
+ * 显式传一个 `undefined` 也会走到同一支，但"键在场"本身是可观察的差别，所以钉住它。
+ */
+test('不填路由时请求里没有 agentOptions 这一个键', async () => {
+  const fake = scriptedSubagents(() => runOf({ output: [{ type: 'text', text: 'ok' }], stopReason: 'completed' }))
+  await dispatch(bindingsFor({ subagents: fake.runtime, modelSelection: selectionOf([ROUTE]) }), 'p')
+  const start = fake.starts[0]
+  assert.ok(start !== undefined)
+  assert.equal(start.hasAgentOptions, false, 'an omitted route must leave the key out of the request')
+  assert.equal(start.agentOptions, undefined)
+})
+
+/** 命中的 route 逐字转发成 `agentOptions`，而 prompt / parent / signal 一个都不变。 */
+test('合法 route 转发成 agentOptions，其余入参一字不变', async () => {
+  const controller = new AbortController()
+  const fake = scriptedSubagents(() => runOf({ output: [{ type: 'text', text: 'ok' }], stopReason: 'completed' }))
+  const bindings = bindingsFor({
+    subagents: fake.runtime,
+    signal: controller.signal,
+    modelSelection: selectionOf([ROUTE, { provider: 'other', model: 'other-model' }]),
+  })
+  await dispatch(bindings, 'p', { provider: ROUTE.provider, model: ROUTE.model })
+  const start = fake.starts[0]
+  assert.ok(start !== undefined)
+  assert.deepEqual(start.agentOptions, { provider: ROUTE.provider, model: ROUTE.model })
+  assert.equal(start.hasAgentOptions, true)
+  assert.equal(start.provider, 'scripted', 'the subagent provider name is still the configured one')
+  assert.equal(start.parent, PARENT)
+  assert.equal(start.signal, controller.signal)
+  assert.deepEqual(start.prompt, [{ type: 'text', text: 'p' }])
+})
+
+/**
+ * 只给 `model` 抛，措辞逐字对齐发现工具（`list-models.ts:47` 的 `` `model` requires `provider` ``）：
+ * 回落成"父 provider 下的 X 模型"会把失败推到一个程序看不见的地方。
+ */
+test('只给 model 抛，措辞与 list_subagent_models 一致', async () => {
+  const fake = scriptedSubagents(() => runOf({ output: [{ type: 'text', text: 'ok' }], stopReason: 'completed' }))
+  const failure = await failureOf(
+    bindingsFor({ subagents: fake.runtime, modelSelection: selectionOf([ROUTE]) }),
+    'p',
+    { model: ROUTE.model },
+  )
+  assert.ok(
+    failure.message.includes('`model` requires `provider`'),
+    `the message must use the discovery tool's wording:\n${failure.message}`,
+  )
+  assert.equal(fake.starts.length, 0, 'a malformed route must not start a child')
+})
+
+/** 只给 `provider` 同待遇：两个都给，或者都不给（phase8-plan §10 Q2 的裁决）。 */
+test('只给 provider 抛，且不产生 start', async () => {
+  const fake = scriptedSubagents(() => runOf({ output: [{ type: 'text', text: 'ok' }], stopReason: 'completed' }))
+  const failure = await failureOf(
+    bindingsFor({ subagents: fake.runtime, modelSelection: selectionOf([ROUTE]) }),
+    'p',
+    { provider: ROUTE.provider },
+  )
+  assert.ok(
+    failure.message.includes('`provider` requires `model`'),
+    `the message must name the missing half:\n${failure.message}`,
+  )
+  assert.equal(fake.starts.length, 0)
+})
+
+/** 没命中的 route 抛，消息里**列出可用 route**——只被告知"不行"的模型改不动自己的调用。 */
+test('route 不在清单里时抛，且消息列出可用 route', async () => {
+  const fake = scriptedSubagents(() => runOf({ output: [{ type: 'text', text: 'ok' }], stopReason: 'completed' }))
+  const failure = await failureOf(
+    bindingsFor({ subagents: fake.runtime, modelSelection: selectionOf([ROUTE]) }),
+    'p',
+    { provider: 'nope', model: 'nope-model' },
+  )
+  assert.match(failure.message, /child LLM route "nope\/nope-model" is not allowed/)
+  assert.match(failure.message, /available routes: route-provider\/route-model/)
+  assert.equal(fake.starts.length, 0)
+})
+
+/**
+ * 策略服务缺席、没开启、清单为空是同一件事——这个部署没有授权任何路由，一律拒绝显式指定
+ * （phase8-plan §3.2、§10 Q1）。消息里的 `(none)` 就是这个事实。
+ */
+test('策略缺席 / 未开启 / 空清单都拒绝显式指定', async () => {
+  const cases: Array<{ readonly label: string; readonly accessor: () => SubagentModelSelection | undefined }> = [
+    { label: 'absent', accessor: () => undefined },
+    { label: 'disabled', accessor: selectionOf([ROUTE], false) },
+    { label: 'empty', accessor: selectionOf([]) },
+  ]
+  for (const { label, accessor } of cases) {
+    const fake = scriptedSubagents(() => runOf({ output: [{ type: 'text', text: 'ok' }], stopReason: 'completed' }))
+    const failure = await failureOf(
+      bindingsFor({ subagents: fake.runtime, modelSelection: accessor }),
+      'p',
+      { provider: ROUTE.provider, model: ROUTE.model },
+    )
+    assert.match(failure.message, /available routes: \(none\)/, `${label}: the deployment authorized no route`)
+    assert.equal(fake.starts.length, 0, `${label}: no child may start`)
+  }
+})
+
+/** 策略是每次调用现读的访问器：run 期间的策略变化立刻生效（phase8-plan §9 R2 的差异）。 */
+test('策略每次调用现读，改掉之后同一次 run 内的下一次派发按新策略判', async () => {
+  const fake = scriptedSubagents(() => runOf({ output: [{ type: 'text', text: 'ok' }], stopReason: 'completed' }))
+  let selection: SubagentModelSelection | undefined = { enabled: true, allowedModels: [ROUTE] }
+  const bindings = bindingsFor({ subagents: fake.runtime, modelSelection: () => selection })
+  await dispatch(bindings, 'p', { provider: ROUTE.provider, model: ROUTE.model })
+  selection = { enabled: true, allowedModels: [] }
+  const failure = await failureOf(bindings, 'p', { provider: ROUTE.provider, model: ROUTE.model })
+  assert.match(failure.message, /available routes: \(none\)/)
+  assert.equal(fake.starts.length, 1, 'only the call made while the route was allowed may start')
+})
+
+/** 可用清单有界：超出上界的部分折成省略号，消息不会随部署配置无限长（phase8-plan §9 R6）。 */
+test('可用 route 列表有界，超出部分折成省略号', async () => {
+  const many = Array.from({ length: 20 }, (_, index) => ({ provider: 'p', model: `m${String(index)}` }))
+  const fake = scriptedSubagents(() => runOf({ output: [{ type: 'text', text: 'ok' }], stopReason: 'completed' }))
+  const failure = await failureOf(
+    bindingsFor({ subagents: fake.runtime, modelSelection: selectionOf(many) }),
+    'p',
+    { provider: 'nope', model: 'nope' },
+  )
+  assert.match(failure.message, /available routes: p\/m0, p\/m1, .*p\/m11, …/)
+  assert.ok(!failure.message.includes('p/m12'), 'the list must stop at its bound')
+})
+
+/** 路由字段的坏值同样是解析边界：非字符串与空串分开报，措辞照发现工具的两条（`:56`、`:69`）。 */
+test('路由字段非字符串或空串都拒绝，且不产生 start', async () => {
+  const fake = scriptedSubagents(() => runOf({ output: [{ type: 'text', text: 'ok' }], stopReason: 'completed' }))
+  const bindings = bindingsFor({ subagents: fake.runtime, modelSelection: selectionOf([ROUTE]) })
+  assert.match((await failureOf(bindings, 'p', { provider: 42, model: 'm' })).message, /`provider` must be a string/)
+  assert.match((await failureOf(bindings, 'p', { provider: 'p', model: 42 })).message, /`model` must be a string/)
+  assert.match((await failureOf(bindings, 'p', { provider: '', model: 'm' })).message, /`provider` must be non-empty/)
+  assert.match((await failureOf(bindings, 'p', { provider: 'p', model: '' })).message, /`model` must be non-empty/)
+  assert.equal(fake.starts.length, 0)
+})
+
+/** 已经中止的 run：坏路由也不该改变化——取消检查先于参数分支，一次 start 都不产生。 */
+test('信号已中止时给了路由仍然不调用 start', async () => {
+  const fake = scriptedSubagents(() => runOf({ output: [{ type: 'text', text: 'ok' }], stopReason: 'completed' }))
+  const controller = new AbortController()
+  controller.abort(new Error('run cancelled'))
+  await assert.rejects(
+    () => dispatch(
+      bindingsFor({ subagents: fake.runtime, signal: controller.signal, modelSelection: selectionOf([ROUTE]) }),
+      'p',
+      { provider: ROUTE.provider, model: ROUTE.model },
+    ),
+    /run cancelled/,
+  )
+  assert.equal(fake.starts.length, 0)
 })
 
 /** `stopReason` 不是 `completed` 就抛，消息里带上 reason（phase2-plan §9 Q1）。 */

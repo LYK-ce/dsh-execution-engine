@@ -1,0 +1,163 @@
+import assert from 'node:assert/strict'
+import { test } from 'node:test'
+import { sdkText } from '../host/sdk.ts'
+
+/**
+ * 模型可见面的 keyless 钉子：`host/sdk.ts` 的 `sdkText(...)` 渲染出的整段 `.d.ts` 逐字钉在这里。
+ *
+ * 这一段进系统提示，是主 agent 写程序时唯一的 API 依据——它改了而没人发现，就是模型按一份不存在的
+ * 接口写程序。仓库级的 keyless 录制会话快照要经 `dsh` CLI + shipped profile + 真 key 录制，而本插件
+ * 现在是 `--patch` overlay、不在任何 shipped profile 里，所以那一份记为**迁移欠账**（phase8-plan §7）；
+ * 本文件是这一阶段能做的等价物。
+ *
+ * 两个超时数字是**插进正文的已解析值**，所以先钉死一组：整段相等就意味着正文与声明都没动，
+ * 也包括那两个数字确实来自入参（下一条用例用另一组再证一次）。
+ */
+const FIXED_TIMEOUTS = { defaultTimeoutMs: 300_000, maxTimeoutMs: 900_000 }
+
+/** `FIXED_TIMEOUTS` 下的逐行期望；行数即 `sdkText` 的输出行数，末尾那一条空串是收尾换行。 */
+const EXPECTED_LINES: readonly string[] = [
+  "## run_program",
+  "",
+  "`run_program` 把一段 TypeScript 程序交给执行引擎，**立刻返回一个 job id**：程序在后台跑，",
+  "不阻塞你当前的回合。每个会话同时只能有一个程序在跑；已经有程序在跑时这次启动会被拒绝，",
+  "错误里带着那个 job id，要先 `cancel_program`。",
+  "",
+  "**程序的结果不会回到你这里**：它跑完、失败或被取消都不会通知你。你在本回合能做的是启动与取消。",
+  "所以程序要写成一个能自己跑完的整体：不确定的步骤派子 agent，确定的步骤跑外部程序——",
+  "写完之后执行是机械的。",
+  "",
+  "程序唯一的回报通道是它自己调的 `report`：每条 report 作为一条独立消息唤醒你，**按程序的调用顺序",
+  "到达**，不会和其他消息挤在一起。报什么、报几次由程序决定——攒到阶段边界再报是你的程序该有的纪律。",
+  "",
+  "`cancel_program` 在**清理真正完成之后**才返回：进程、子 agent 与临时目录都已经收干净。",
+  "程序里**没有 `await` 的外部程序也算在清理范围内**，所以取消可能要等到它结束——",
+  "这段时间受那一次 `process` 自己的超时约束。",
+  "",
+  "程序是**可擦除 TypeScript**：类型只是装饰，运行时被剥掉，没有编译期检查。",
+  "`enum`、带运行时语义的 `namespace`、构造器参数属性一类需要生成代码的写法会被拒绝，报错会说明怎么改。",
+  "",
+  "程序在独立进程里运行，顶层 `await` 与 `return` 可用。程序里可用的 API：",
+  "",
+  "```ts",
+  "/** 本次 run 的上下文。 */",
+  "declare const flow: {",
+  "  /** 本次 run 专属的临时目录；引擎创建，run 结束时整体删除。 */",
+  "  readonly tmpDir: string",
+  "}",
+  "",
+  "/**",
+  " * 派一个子 agent 执行一段工作，返回它的最终文本。prompt 是程序里的字面量。",
+  " * 正常完成但没有文本块时是空串——那是\"子 agent 没产出文本\"，不是\"答案被丢了\"。",
+  " * `provider` 与 `model` 一起给，才能指定这一步用哪个模型；两个都不给就是沿用当前会话的模型。",
+  " * 这两个 id 先用你的 `list_subagent_models` 工具查（不带参数列 provider，带 `provider` 列它的 model）；",
+  " * 查不到就说明这个部署没有开放任何可选路由——不要猜 id。",
+  " * 不在部署允许清单里的 route 会在调用时被拒绝，错误里会列出可用的 route。",
+  " */",
+  "declare function dispatchsubagent(",
+  "  prompt: string,",
+  "  opts?: { provider?: string; model?: string },",
+  "): Promise<string>",
+  "",
+  "/** 执行一个外部程序。非零退出码与超时都正常返回，由程序自己判断。 */",
+  "declare function process(argv: string[], opts?: ProcessOptions): Promise<ProcessResult>",
+  "",
+  "/** 同 process，但非零退出码或超时抛出。用于表达\"这一步必须成功\"。 */",
+  "declare function processOrThrow(argv: string[], opts?: ProcessOptions): Promise<ProcessOutput>",
+  "",
+  "/**",
+  " * 向发起你的会话单向汇报一段内容。它成为那边独立的一轮，按你调用的顺序到达。",
+  " * await 只等投递成功，不等它处理完；程序被取消时已经投出去但还没被读到的汇报会作废。",
+  " */",
+  "declare function report(text: string): Promise<void>",
+  "",
+  "/** 读一个文本文件。路径应当落在 flow.tmpDir 或本次 run 的工作目录内——这是给程序的引导，不是安全边界。 */",
+  "declare function readTextFile(path: string): Promise<string>",
+  "",
+  "/** 写一个文本文件。路径应当落在 flow.tmpDir 或本次 run 的工作目录内——这是给程序的引导，不是安全边界。 */",
+  "declare function writeTextFile(path: string, text: string): Promise<void>",
+  "",
+  "/** 路径是否存在。路径应当落在 flow.tmpDir 或本次 run 的工作目录内——这是给程序的引导，不是安全边界。 */",
+  "declare function exists(path: string): Promise<boolean>",
+  "",
+  "/** 标准 fetch。 */",
+  "declare function fetch(input: string, init?: object): Promise<Response>",
+  "",
+  "/** 程序自己的输出；它随这次 run 的结果一起被记录。 */",
+  "declare const console: {",
+  "  log(...args: unknown[]): void",
+  "  info(...args: unknown[]): void",
+  "  warn(...args: unknown[]): void",
+  "  error(...args: unknown[]): void",
+  "  debug(...args: unknown[]): void",
+  "}",
+  "",
+  "interface ProcessOptions {",
+  "  /** 本次执行的超时（毫秒）。默认 300000，上限 900000；超上限在执行前被拒绝。 */",
+  "  timeoutMs?: number",
+  "}",
+  "",
+  "interface ProcessResult {",
+  "  /** 退出码；进程被信号杀死（例如超时）时为 -1。 */",
+  "  code: number",
+  "  /** 诊断用标准输出；不承载业务返回值。 */",
+  "  stdout: string",
+  "  /** 诊断用标准错误。 */",
+  "  stderr: string",
+  "  /** 本次执行是否撞上了超时。 */",
+  "  timedOut: boolean",
+  "}",
+  "",
+  "interface ProcessOutput {",
+  "  stdout: string",
+  "  stderr: string",
+  "}",
+  "```",
+  "",
+  "取值约定：跨进程没有 `return`，`stdout` / `stderr` 只用于诊断。值确实在外部脚本里时，",
+  "让脚本写文件、程序读文件：",
+  "",
+  "```ts",
+  "await processOrThrow(['python', 'add.py', '1', '2'])   // 非零就抛，不会往下走",
+  "const sum = Number(await readTextFile(flow.tmpDir + '/result.txt'))   // 到这一行，脚本一定成功",
+  "```",
+  "",
+  "先用 `processOrThrow` 确认成功再读文件，否则会读到不存在的或写了一半的文件。",
+  "",
+  "`dispatchsubagent` 的失败也是异常：子 agent 没有正常完成时它抛出，消息里带结束的类别",
+  "（`error` / `refusal` / `max-tokens` 一类），以及 provider 写的诊断与结束前已产生的部分输出。",
+  "要用它的返回值就必须自己 `try/catch`——静默拿到一段可能是错误描述的文字，会让失败伪装成成功。",
+  "",
+]
+
+/** `.d.ts` 渲染文本逐字相等：正文、声明与两个超时数字都在这一条里。 */
+test('sdkText 的整段渲染文本逐字钉住', () => {
+  assert.equal(sdkText(FIXED_TIMEOUTS), EXPECTED_LINES.join('\n'))
+})
+
+/**
+ * 两个超时数字取自**已解析的**配置：换一组入参整段就要跟着变，否则模型看到的是一份假文档
+ * （`host/sdk.ts` 的模块头）。这一条同时证明上一条的钉子不是"函数返回了个常量"。
+ */
+test('超时数字随入参变化', () => {
+  const other = sdkText({ defaultTimeoutMs: 1_000, maxTimeoutMs: 2_000 })
+  assert.notEqual(other, EXPECTED_LINES.join('\n'))
+  assert.ok(other.includes('默认 1000，上限 2000；超上限在执行前被拒绝。'))
+  assert.ok(!other.includes('默认 300000'))
+})
+
+/**
+ * 阶段 8 的程序可见面：第二个参数就是 `{ provider?, model? }`。声明与它上面那段正文一起钉在这条里，
+ * 因为"模型知不知道可以指定模型"完全取决于这段文本。
+ */
+test('dispatchsubagent 的声明与正文说明按调用指定模型', () => {
+  const text = sdkText(FIXED_TIMEOUTS)
+  assert.ok(text.includes([
+    'declare function dispatchsubagent(',
+    '  prompt: string,',
+    '  opts?: { provider?: string; model?: string },',
+    '): Promise<string>',
+  ].join('\n')))
+  assert.ok(text.includes('这两个 id 先用你的 `list_subagent_models` 工具查'))
+  assert.ok(text.includes('不在部署允许清单里的 route 会在调用时被拒绝，错误里会列出可用的 route。'))
+})

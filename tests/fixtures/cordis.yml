@@ -50,6 +50,23 @@
 - id: scripted-subagent
   name: './scripted-subagent-provider.ts'
 
+# 阶段 8 追加：`dispatchsubagent` 的显式子 agent 模型路由**授权来源**。
+#
+# 引擎读它走 `ctx.get('subagentModelSelection')`（不在 `inject` 里，理由与 connection 同一条：
+# 它是部署特性，缺席只该让"程序显式指定路由"被响亮地拒绝），所以这一行不是为了本插件激活，
+# 而是让 B15 能验"清单里那条 route 真的被放行、清单外那条真的被拒"。
+#
+# provider/model 这里指的是 **LLM 路由 id**，与上面那个 `subagentProvider: scripted` 是两个命名
+# 空间：前者是子 agent 用什么模型，后者是子 agent 由哪个 provider 起。两者刻意取了不同的名字，
+# 这样"引擎原样转发、不去猜"在断言里才看得见。
+- id: subagent-model-selection
+  name: '@deepseek-ai/dsh-tool-subagent/model-selection-settings'
+  config:
+    enabled: true
+    allowedModels:
+      - provider: scripted-provider
+        model: scripted-model
+
 # 阶段 3 追加：后台 job 注册表与 agent 注册表。
 # job 的 owner 必须是**活着的、已注册的** agent 实例——jobs-local 的 `ensureOwnerCleanup` 会比对
 # `agents.get(ownerId) === owner`，不等就直接拒绝（packages/jobs/jobs-local/src/index.ts:448-456）。

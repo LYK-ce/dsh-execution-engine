@@ -53,8 +53,15 @@ declare const flow: {
 /**
  * 派一个子 agent 执行一段工作，返回它的最终文本。prompt 是程序里的字面量。
  * 正常完成但没有文本块时是空串——那是"子 agent 没产出文本"，不是"答案被丢了"。
+ * \`provider\` 与 \`model\` 一起给，才能指定这一步用哪个模型；两个都不给就是沿用当前会话的模型。
+ * 这两个 id 先用你的 \`list_subagent_models\` 工具查（不带参数列 provider，带 \`provider\` 列它的 model）；
+ * 查不到就说明这个部署没有开放任何可选路由——不要猜 id。
+ * 不在部署允许清单里的 route 会在调用时被拒绝，错误里会列出可用的 route。
  */
-declare function dispatchsubagent(prompt: string): Promise<string>
+declare function dispatchsubagent(
+  prompt: string,
+  opts?: { provider?: string; model?: string },
+): Promise<string>
 
 /** 执行一个外部程序。非零退出码与超时都正常返回，由程序自己判断。 */
 declare function process(argv: string[], opts?: ProcessOptions): Promise<ProcessResult>

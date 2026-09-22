@@ -19,6 +19,10 @@ import type { SandboxPolicyService } from '@deepseek-ai/dsh-sandbox-policy'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 // 仅类型：解析 `ctx.systemPrompt` 与 `ctx.jobs` 的服务声明。
 import type {} from '@deepseek-ai/dsh-system-prompt'
+// 仅类型：`ctx.get('subagentModelSelection')` 的服务声明与 `current()` 由它合并进来。
+// 走的是那个包的公开子路径，不是包根：策略服务有自己的入口
+// （packages/subagent/tool-subagent/package.json 的 `./model-selection-settings`）。
+import type {} from '@deepseek-ai/dsh-tool-subagent/model-selection-settings'
 import { CANCEL_PATH, STATE_PATH } from '../shared/protocol.ts'
 import {
   DEFAULT_PROCESS_TIMEOUT_MS,
@@ -70,6 +74,10 @@ export const name = 'execution-engine'
  * 那是拿客户端特性绑架引擎本体。改成可选注入：传输在场时才注册路由
  * （先例 `packages/client/connection/src/index.ts:119`、`packages/api/gateway/src/index.ts:198`）。
  * 代价是"面板没出现"不再被响亮地报出来——这是有意的取舍，design.md §8.2 把面板列为第二批交付物。
+ *
+ * **`subagentModelSelection` 同样不在 `inject` 里**，理由与 `connection` 一模一样：它是 web-app
+ * bundle 挂的部署特性。进 `inject` 就等于"没有那份策略的部署连 `run_program` 都不注册"；走可选
+ * 注入时，缺席只让"程序显式指定子 agent 路由"被拒绝，而且拒绝是响亮的（phase8-plan §3.1）。
  */
 export const inject = ['tools', 'jobs', 'ptcRuntime', 'subprocess', 'subagents', 'sandbox', 'systemPrompt']
 
@@ -141,6 +149,11 @@ export function apply(ctx: Context, config: Config): void {
       sandbox: ctx.sandbox,
       timeouts,
       subagentProvider,
+      // 子 agent 的显式模型路由授权来自**同一份**部署策略（phase8-plan §3.1）：不做快照，
+      // 每次调用现读 `current()`，所以 run 期间的策略变化立刻生效（§9 R2）。
+      // 策略服务不在 `inject` 里，理由与 `connection` 同一条——它是 web-app bundle 挂的
+      // 部署特性，缺席只该让"显式指定路由"被拒，不该让整个引擎不注册。
+      modelSelection: () => ctx.get('subagentModelSelection')?.current(),
       warn: (message) => { ctx.logger.warn(message) },
     },
     request,

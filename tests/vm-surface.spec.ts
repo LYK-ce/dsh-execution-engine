@@ -287,6 +287,61 @@ return { ok, failure, syncThrow }
 })
 
 /**
+ * 阶段 8：程序给的第二个参数过外壳。配对与取值是否合法由绑定那一层判（`readRequest`）——外壳只转发
+ * `provider` / `model` 两个键（程序侧声明的就是这两个，见 `host/sdk.ts` 的 `.d.ts`），并**拒绝**其余自有键。
+ * 这里钉三件：两个键逐字过界、没给的键不出现、不该过界的（非对象、数组、未知键）当场拒绝。
+ *
+ * 未知键那条不是洁癖：姊妹工具的字段叫 `reasoning_effort`，`{ provider, model, reasoning_effort: 'high' }`
+ * 若被静静丢掉，程序会以默认 effort **成功**返回，而绑定那一层根本收不到那个键——没有任何一层能报错。
+ */
+test('dispatchsubagent 的 provider / model 过外壳，未给的键不出现', async () => {
+  const { root, tmpDir } = await makeRoots()
+  const calls: unknown[] = []
+  const namespace = Object.create(null) as Record<string, unknown>
+  Object.defineProperty(namespace, 'dispatchsubagent', {
+    enumerable: true,
+    value: (args: unknown): Promise<string> => {
+      calls.push(args)
+      return Promise.resolve('child')
+    },
+  })
+  try {
+    const value = await runGuest({
+      tmpDir,
+      cwd: root,
+      flow: namespace,
+      program: `
+await dispatchsubagent('plain')
+await dispatchsubagent('routed', { provider: 'route-provider', model: 'route-model' })
+// 只给一个也过外壳：配对是否成立是绑定那一层的事。
+await dispatchsubagent('half', { model: 'route-model' })
+let bad = 'none'
+try { await dispatchsubagent('bad', 42) } catch (error) { bad = String(error && error.message) }
+let array = 'none'
+try { await dispatchsubagent('array', ['route-provider', 'route-model']) } catch (error) { array = String(error && error.message) }
+// 未知的自有键：不能静静丢掉——它会让程序以默认 effort 成功，而没人知道它被丢了。
+let unknown = 'none'
+try { await dispatchsubagent('unknown', { provider: 'route-provider', model: 'route-model', reasoning_effort: 'high' }) } catch (error) { unknown = String(error && error.message) }
+return { bad, array, unknown }
+`,
+    })
+    assert.deepEqual(asJson(value), {
+      bad: 'dispatchsubagent options must be an object with at most `provider` and `model`',
+      array: 'dispatchsubagent options must be an object with at most `provider` and `model`',
+      unknown: 'dispatchsubagent options accept only `provider` and `model`; unknown key: reasoning_effort',
+    })
+    // 三条被拒的调用都到不了绑定：拒绝发生在外壳，`calls` 里只有前面三次。
+    assert.deepEqual(calls, [
+      { prompt: 'plain' },
+      { prompt: 'routed', provider: 'route-provider', model: 'route-model' },
+      { prompt: 'half', model: 'route-model' },
+    ])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+/**
  * `report` 是阶段 4 加进来的单向汇报通道：外壳把 `text` 包成绑定参数转发出去，绑定拒绝时程序看到
  * 拒绝，而**投递结果不回程序**（design.md §6.3：等投递成功，不等主 agent 处理完）。真实的投递与
  * 作废由 loader 驱动（B11/B12）覆盖；这里钉住的是"程序能调到它、参数过外壳、结果是 void"。

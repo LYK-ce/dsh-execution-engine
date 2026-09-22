@@ -69,7 +69,7 @@ DSH 里已有两个相邻能力，本插件 ≈ **后台化的、带 `process` �
 
 ```ts
 /** 派一个子 agent 执行一段工作，返回它的最终文本。非确定。 */
-dispatchsubagent(prompt: string): Promise<string>
+dispatchsubagent(prompt: string, opts?: { provider?: string; model?: string }): Promise<string>
 
 /** 执行一个外部程序。非零退出码与超时都正常返回，由程序自己判断。 */
 process(argv: string[], opts?: ProcessOptions): Promise<ProcessResult>
@@ -80,6 +80,8 @@ processOrThrow(argv: string[], opts?: ProcessOptions): Promise<ProcessOutput>
 /** 向主 agent 单向汇报一段内容。 */
 report(text: string): void
 ```
+
+`dispatchsubagent` 的第二个参数是阶段 8 加的：程序可以按**这一次调用**指定子 agent 用哪个模型。`provider` 与 `model` 必须成对给出（只给一个就抛，不回落），授权来源是部署挂的 `subagent-model-selection` 策略——引擎读**同一份**清单，不新造第二份白名单，也不查 LLM 目录（那是 advisory）。两个都不给就是沿用当前会话的模型，与阶段 2 的语义一致。发现走主 agent 的 `list_subagent_models` 工具，`.d.ts` 不抄目录（§12 阶段 8）。
 
 分工：
 
@@ -583,6 +585,54 @@ interface ProcessOutput {
   超出本阶段"只碰 `Workspace/ExecutionEngine/`"的边界。默认部署下的实际行为（`tool-jobs` 仍会唤醒一次、
   模型仍能用三个通用 job 工具）记在 README 的「已知限制」里，作为一条如实的账。
 
+### 阶段 8 — 按调用指定子 agent 模型
+
+**做什么**
+
+- `dispatchsubagent` 加第二个参数 `opts?: { provider?: string; model?: string }`，转发成 `SubagentStartRequest.agentOptions`。
+- 校验读**同一份** `ctx.subagentModelSelection` 策略；服务缺席、未开启、清单为空、route 未命中都拒绝显式指定。
+- `.d.ts` 指向 `list_subagent_models`，不抄目录。
+
+**验证**：A 档（typecheck / test / build / `node --check`）+ 插件自己的 `.d.ts` golden 断言；B 档新增 B15。
+
+**本阶段的交付与验收落点（阶段 8 实现时补记）**
+
+- **程序可见面**：`dispatchsubagent(prompt, opts?)`。加了 `reasoningEffort` 之外的两个字段，**只加这两个**。
+  外壳（`host/guest-source.ts`）拒绝 `provider` / `model` 之外的自有键：静默丢掉它们会得到"成功但用的不是
+  它要的东西"——姊妹工具的字段叫 `reasoning_effort`，丢掉了就是默认 effort，而绑定那一层看不到那个键。
+- **授权来源是同一份策略**：`ctx.get('subagentModelSelection')`，与 `tool-subagent` 用的是同一个服务；不在
+  `inject` 里，理由与 `connection` 同一条（它是 web-app bundle 挂的部署特性，缺席只该让"显式指定"被拒，
+  不该让 headless 部署连 `run_program` 都不注册）。
+- **与 `tool-subagent` 的一处有意差异**：那个工具在组合时**快照**策略，引擎每次 `dispatchsubagent` 调用现读
+  `current()`。真原因是**引擎没有每会话组合点**——工具在插件加载时注册一次，run 是会话起来之后才有的；快照
+  一份就等于策略改动后引擎一直按旧的那份判，而校验的对象必须是这一次调用的参数。**后果**：会话中途改动设置
+  之后，`list_subagent_models` 广告的是它组合时快照的策略、引擎执行的是现读的策略，不一致时会出现
+  "广告了却被拒"（快照里已删掉的 route 还在广告、调用被引擎拒；刚加上的 route 能执行却没人广告）。
+- **拒绝的形态**：只给 `model` 抛——**沿用** `packages/subagent/tool-subagent/src/list-models.ts:47` 的同一句
+  `` `model` requires `provider` ``，外面加 `dispatchsubagent: ` 标明是哪个原语拒的（整条消息不是逐字一样的）；
+  只给 `provider` 同待遇；没命中的 route 抛，消息里列出可用 route（`available routes: …`；一条都没有时是
+  `(none)`），让模型能自我纠正。列表有界（12 条 + 省略号）。
+- **不查什么**：不查 `capabilities.agentOptions`（`ctx.subagents.start` 自己会拒）、不查 LLM 目录
+  （`LlmModelInfo` 的目录成员资格是 advisory）、不查 `ctx.llm.listProviders()`——引擎不注入 `ctx.llm`。
+  **不注入 `ctx.llm` 的代价**：策略里列了未注册的 provider 时校验照样通过、`start` 也成功
+  （`assertCapabilities` 只查能力位、`resolveChildAgentOptions` 只合并父子路由，都不查注册），子 agent 会话
+  建出来之后**第一次模型请求**才在 LLM 适配器层炸——仍然响亮，但晚了一整层、措辞也是 provider 层的
+  （`AgentOptions.provider` 的契约是"call time 必须有注册的适配器"，`packages/core/agent/src/runtime-types.ts:26-35`）。
+  发现侧先一步兜住：`list_subagent_models` 的无参清单用 `listProviders()` 过滤，未注册的 provider 根本不出现。
+- **A 档（本会话跑过）**：`pnpm run typecheck`、`pnpm run test`（104 条全绿）、`pnpm run build`、
+  `node --check lib/client.js`，以及 bundle 里模块 id 与 locale 键的断言。
+- **B 档新增 B15**（由负责人跑）：命中清单的 route 逐字到脚本化 provider 的 `agentOptions`、不填时那个键
+  不在场、清单外的 route 抛出且消息带可用清单、只给 `model` 抛出且消息里含同一句
+  `` `model` requires `provider` ``。fixture 为此挂上
+  `subagent-model-selection-settings`，脚本化 provider 声明 `agentOptions` 能力位并记录完整请求。
+- **C 档多一条判据**：C 档组合里 `subagent-model-selection-settings` 由 web-app bundle 挂
+  （`packages/bundle/web-app/cordis.patch.yml:47`，那一行没有 config，所以服务在场、策略关闭）：默认状态下带
+  `{ provider, model }` 的调用被拒且清单是 `(none)`；在设置里打开并加一条 route 之后同一段程序跑通——这是
+  "引擎读得到**真部署**的策略"唯一看得见的形态（B15 用的是 fixture 自己挂的同名服务）。
+- **仓库级 keyless 快照仍未产出（迁移欠账）**：`snapshots/AGENTS.md` 要求每个被测进程经 `dsh` CLI + 一个
+  shipped profile 启动，而本插件今天是 `--patch` overlay、不在任何 shipped profile 里。本阶段用插件自己的
+  golden 断言（`tests/sdk-text.spec.ts`）把 `.d.ts` 渲染文本逐字钉住；仓库那一份随迁移补。**
+
 ## 13. 待定项的结论（阶段 7 结清）
 
 七项逐项结清。结论给在这里，逐条证据与可执行步骤在 `README.md` 里。
@@ -621,6 +671,9 @@ interface ProcessOutput {
 - `packages/workflow/workflow-ptc/README.md` — 执行引擎与 host/guest/binding 模板
 - `packages/ptc-runtime/ptc-runtime/README.md` — 执行缝、超时语义、Python fd-3 协议
 - `packages/jobs/jobs/README.md` — 后台 job 契约与 owner 隔离
+- `packages/subagent/tool-subagent/src/list-models.ts` — `list_subagent_models` 的形态与错误措辞（阶段 8 对齐它）
+- `packages/subagent/tool-subagent/src/model-selection-settings.ts` — `subagentModelSelection` 服务与 `current()`（阶段 8 的授权来源）
+- `packages/subagent/subagent/src/types.ts` / `child-agent.ts` — `agentOptions` 与父路由的合并语义
 - `packages/core/agent-loop/README.md` — agent 创建、turn/step、取消
 - `packages/core/agent/src/runtime-types.ts` — `send` / `followup` / `steer` / `inject` 投递接口
 - `Workspace/design.md` — Blackboard 设计文档（本文档格式参照）

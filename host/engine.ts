@@ -29,6 +29,7 @@ import { createProcessBindings } from './process-binding.ts'
 import { createReportBindings } from './report-binding.ts'
 import type { ReportLedger } from './report-binding.ts'
 import { createSubagentBindings } from './subagent-binding.ts'
+import type { SubagentModelSelection } from './subagent-binding.ts'
 import { createRunTmpDir, removeRunTmpDir } from './tmp-dir.ts'
 
 /** 一条 `flow/call-start` 事件去掉 run 身份后的部分；身份由 `host/job-runner.ts` 补。 */
@@ -102,6 +103,11 @@ export interface RunProgramDeps {
   readonly timeouts: ProcessTimeouts
   /** 部署配置里的子 agent provider 名。 */
   readonly subagentProvider: string
+  /**
+   * 读本部署允许的显式子 agent 路由。做成访问器：策略可以在 run 期间改变，而校验的对象是
+   * 每一次 `dispatchsubagent` 调用的参数（host/subagent-binding.ts 的 `assertAllowedRoute`）。
+   */
+  readonly modelSelection: () => SubagentModelSelection | undefined
   /** 清理失败一类非致命问题的告警出口。 */
   readonly warn: (message: string) => void
 }
@@ -149,6 +155,7 @@ export async function runProgram(deps: RunProgramDeps, request: RunProgramReques
       provider: deps.subagentProvider,
       signal: request.signal,
       subagents: deps.subagents,
+      modelSelection: deps.modelSelection,
       warn: deps.warn,
     }),
     ...createReportBindings({

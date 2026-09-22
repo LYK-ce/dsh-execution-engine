@@ -49,6 +49,9 @@
  *   report 同序、没有还开着的调用）、`since` 增量的三种取值（最新/中间/比最新还大）、以及
  *   **经路由取消**：与工具取消同一条路径，响应回来时临时目录已经删掉（与 B9 同一判据形态）、
  *   run 的终态在面板状态里是 `killed`，再取消一次幂等地回 `cancelled: false`。
+ * - B15 按调用指定子 agent 模型（阶段 8）：命中 `allowedModels` 的 route 逐字到脚本化 provider 的
+ *   `agentOptions`；不填时请求里**没有**这一个键（继承语义没变）；清单外的 route 抛出且消息里列出
+ *   可用 route；只给 `model` 抛出且措辞与 `list_subagent_models` 一致。
  *
  * 受限组合（`tests/fixtures/cordis-confined.yml`，workspace-write）：
  * - B5 `process` 起的外部进程过发起会话的文件策略：同一个程序里，写工作目录外的路径被
@@ -56,7 +59,7 @@
  *
  * 用法（cwd = 仓库根，必须带 tsx，否则裸包名解析不到源码）：
  *   node --import tsx/esm Workspace/ExecutionEngine/tests/loader-driver.ts \
- *     Workspace/ExecutionEngine/tests/fixtures/cordis.yml              # B0–B4、B6–B12
+ *     Workspace/ExecutionEngine/tests/fixtures/cordis.yml              # B0–B4、B6–B15
  *   node --import tsx/esm Workspace/ExecutionEngine/tests/loader-driver.ts \
  *     Workspace/ExecutionEngine/tests/fixtures/cordis-confined.yml     # B0、B5、B8
  *
@@ -591,6 +594,65 @@ try {
     )
     assert.equal(scriptedStarts().length, 3, 'the failing dispatch must still have reached the provider')
     process.stdout.write('B6 non-completed child throws with its reason and diagnostic: OK\n')
+
+    // ---- B15：按调用指定子 agent 模型（阶段 8） --------------------------------
+    // 授权来源是 fixture 里那份 `subagent-model-selection` 策略。判据四段，一段一个语义：
+    // 命中清单的 route 逐字到执行缝、不填就一个键都不加、清单外的 route 被拒且消息里带可用清单、
+    // 只给 model 的措辞与 `list_subagent_models` 一致。前两段的观察点是脚本化 provider 记下的
+    // `agentOptions`——它声明了 `agentOptions` 能力位，所以请求真的到得了它（否则 service 先拒）。
+    // ROUTE 必须与 fixtures/cordis.yml 的 `allowedModels` 一致；不一致时第一段 dispatch 就会抛，
+    // 程序以失败小节收场，下面第一条断言当场拦住。
+    const ROUTE = { provider: 'scripted-provider', model: 'scripted-model' }
+    const startsBeforeB15 = scriptedStarts().length
+    const b15 = await runToCompletion(`
+const routed = await dispatchsubagent('routed', { provider: ${JSON.stringify(ROUTE.provider)}, model: ${JSON.stringify(ROUTE.model)} })
+const plain = await dispatchsubagent('plain')
+let denied = 'none'
+try {
+  await dispatchsubagent('denied', { provider: ${JSON.stringify(ROUTE.provider)}, model: 'not-allowed' })
+} catch (error) {
+  denied = String(error && error.message)
+}
+let half = 'none'
+try {
+  await dispatchsubagent('half', { model: ${JSON.stringify(ROUTE.model)} })
+} catch (error) {
+  half = String(error && error.message)
+}
+return { routed, plain, denied, half }
+`)
+    assertProgramSucceeded(b15, 'B15')
+    const b15Value = returned(b15) as { routed: string; plain: string; denied: string; half: string }
+    assert.deepEqual(
+      { routed: b15Value.routed, plain: b15Value.plain },
+      { routed: SCRIPTED_REPLY, plain: SCRIPTED_REPLY },
+      'both accepted dispatches must reach the scripted provider and come back',
+    )
+
+    const b15Starts = scriptedStarts().slice(startsBeforeB15)
+    assert.equal(b15Starts.length, 2, 'only the two accepted dispatches may reach the provider')
+    assert.deepEqual(b15Starts.map(entry => entry.prompt), ['routed', 'plain'])
+    assert.deepEqual(
+      b15Starts[0]?.agentOptions,
+      { provider: ROUTE.provider, model: ROUTE.model },
+      'the requested route must reach ctx.subagents verbatim',
+    )
+    assert.equal(
+      b15Starts[1]?.hasAgentOptions,
+      false,
+      'an omitted route must leave agentOptions out of the request, so the child inherits the parent route',
+    )
+
+    assert.match(b15Value.denied, /child LLM route "scripted-provider\/not-allowed" is not allowed/)
+    assert.ok(
+      b15Value.denied.includes(`available routes: ${ROUTE.provider}/${ROUTE.model}`),
+      `the rejection must list the routes this deployment allows:\n${b15Value.denied}`,
+    )
+    assert.ok(
+      b15Value.half.includes('`model` requires `provider`'),
+      `an unpaired model must use the discovery tool's wording:\n${b15Value.half}`,
+    )
+    process.stdout.write('B15 per-call subagent model route: OK\n')
 
     // ---- B7：单例 -------------------------------------------------------------
     // A 会睡 60s，只有在"真的后台跑"的前提下才可能撞上单例。
