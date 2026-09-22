@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { guestSource } from '../host/capabilities.ts'
+import { PREVIEW_MAX_CHARS } from '../host/guest-source.ts'
 
 /**
  * PTC 引导用的同一个 async 函数构造器；外壳正文就是它的 body，形参名必须与
@@ -40,6 +41,53 @@ function stubFlow(result: { code: number; stdout: string; stderr: string; timedO
     })
   }
   return { namespace, calls }
+}
+
+/** 外壳经 `flow.trace` 发来的一条上报记录；字段与 `host/engine.ts` 的解析边界一致。 */
+interface StubTrace {
+  readonly phase: string
+  readonly callId: number
+  readonly member: string
+  readonly line: number | null
+  readonly args?: string
+  readonly argsTruncated?: boolean
+  readonly ms?: number
+  readonly outcome?: string
+  readonly text?: string
+  readonly textTruncated?: boolean
+}
+
+/**
+ * `flow.trace` 的转录桩。外壳按 fire-and-forget 调它（不等回执），所以这里同步记录、返回一个
+ * 已兑现的 promise——真实链路里它是一条跨进程的绑定调用。
+ */
+function traceStub(): { namespace: Record<string, unknown>; records: StubTrace[] } {
+  const records: StubTrace[] = []
+  const namespace = Object.create(null) as Record<string, unknown>
+  Object.defineProperty(namespace, 'trace', {
+    enumerable: true,
+    value: (args: unknown): Promise<null> => {
+      records.push(args as StubTrace)
+      return Promise.resolve(null)
+    },
+  })
+  return { namespace, records }
+}
+
+/**
+ * 拼出外壳拿到的那个绑定命名空间。真实链路上 PTC 每个 global 一个对象，本插件只声明 `flow`
+ * 一个（`host/engine.ts` 的 `bindings`），所以这里把若干桩合成同一个对象。
+ * @param parts - 待合成的命名空间，后面的同名成员覆盖前面的。
+ * @returns 合成后的 `flow` 命名空间。
+ */
+function flowNamespace(...parts: readonly Record<string, unknown>[]): Record<string, unknown> {
+  const merged = Object.create(null) as Record<string, unknown>
+  for (const part of parts) {
+    for (const name of Object.getOwnPropertyNames(part)) {
+      Object.defineProperty(merged, name, { enumerable: true, value: part[name] })
+    }
+  }
+  return merged
 }
 
 /** 在测试进程里按 PTC 的方式跑一次外壳 + 用户程序。 */
@@ -322,6 +370,9 @@ return { text, present, missing, dotted, escaped, wroteOutside, climbed }
 /**
  * 行号映射（阶段 5 的地基）：用户源码第 N 行在 vm 里就是第 N 行。
  * 外壳给编译包装固定加了一行前缀，`lineOffset: -1` 把它抵掉。
+ *
+ * 第三条是**跨行**类型注解的对照：`host/capabilities.ts` 的 `stripUserProgram` 声称擦除只删类型、
+ * 行号与列号不变，而前两条程序里一条跨行注解都没有——只测"单行源码"证明不了这一条。
  */
 test('用户程序的行号在拼接后不变', async () => {
   const { root, tmpDir } = await makeRoots()
@@ -340,6 +391,306 @@ test('用户程序的行号在拼接后不变', async () => {
         return true
       },
     )
+    // 跨行类型注解：擦除删掉的是类型，行结构一个都不许动（第 5 行是 throw 那一行）。
+    await assert.rejects(
+      runGuest({
+        tmpDir,
+        cwd: root,
+        program: [
+          'const config: {',
+          '  readonly a: number',
+          '  b: string',
+          '} = { a: 1, b: "two" }',
+          'throw new Error("after a multi-line annotation")',
+        ].join('\n'),
+      }),
+      (error: unknown) => {
+        assert.match(String((error as Error).stack), /flow-program\.ts:5/)
+        return true
+      },
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+/**
+ * 阶段 5 的行号映射：包装层取到的是**用户源码**的行号，不是外壳自己的。
+ *
+ * 包装让栈里多出一层帧（`callSiteLine` → 包装函数 → 用户程序），但正则只认
+ * `flow-program.ts`，所以第一个匹配到的一定是用户那一帧。行号在下面**写死**：每一条都对照
+ * 它所在数组位置（1-based），弱断言（"大于 0"）证明不了偏移是对的。
+ */
+test('包装层上报调用点行号，行号等于用户源码行号', async () => {
+  const { root, tmpDir } = await makeRoots()
+  const trace = traceStub()
+  const flow = flowNamespace(
+    trace.namespace,
+    stubFlow({ code: 0, stdout: '', stderr: '', timedOut: false }).namespace,
+    {
+      dispatchsubagent: (): Promise<string> => Promise.resolve('child'),
+      report: (): Promise<null> => Promise.resolve(null),
+    },
+  )
+  try {
+    await runGuest({
+      tmpDir,
+      cwd: root,
+      flow,
+      program: [
+        "const first = await process(['python', 'one'])",
+        "const second = await processOrThrow(['python', 'two'])",
+        "await dispatchsubagent('three')",
+        "await report('four')",
+        'for (let index = 0; index < 2; index++) {',
+        "  await process(['python', 'loop'])",
+        '}',
+        'return first.code',
+      ].join('\n'),
+    })
+    assert.deepEqual(
+      trace.records.map(record => [record.phase, record.member, record.line]),
+      [
+        ['start', 'process', 1],
+        ['end', 'process', 1],
+        ['start', 'processOrThrow', 2],
+        ['end', 'processOrThrow', 2],
+        ['start', 'dispatchsubagent', 3],
+        ['end', 'dispatchsubagent', 3],
+        ['start', 'report', 4],
+        ['end', 'report', 4],
+        ['start', 'process', 6],
+        ['end', 'process', 6],
+        ['start', 'process', 6],
+        ['end', 'process', 6],
+      ],
+      '循环里同一行重复出现是正常的：不去重，行号相同、序号不同',
+    )
+    // 序号按调用发生顺序由外壳发给宿主，start 与它配对的那条 end 同号。
+    assert.deepEqual(trace.records.map(record => record.callId), [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5])
+    // 记录就是宿主那条解析边界（`host/engine.ts` 的 `readTraceRecord`）的输入面：字段多一个少一个都会
+    // 在那边被拒，所以这里把两相的字段集逐一钉住。
+    assert.deepEqual(Object.keys(trace.records[0] ?? {}).sort(), [
+      'args', 'argsTruncated', 'callId', 'line', 'member', 'phase',
+    ])
+    assert.deepEqual(Object.keys(trace.records[1] ?? {}).sort(), [
+      'callId', 'line', 'member', 'ms', 'outcome', 'phase', 'text', 'textTruncated',
+    ])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+/**
+ * 阶段 5 的隔离面：`trace` 是外壳与宿主之间的内部通道，**程序看不见它**。
+ * 程序看得见的仍然只有四个原语 + `flow.tmpDir` + 文件助手 + `console` + `fetch`。
+ */
+test('trace 不在程序可见面上', async () => {
+  const { root, tmpDir } = await makeRoots()
+  const trace = traceStub()
+  try {
+    const value = await runGuest({
+      tmpDir,
+      cwd: root,
+      flow: flowNamespace(trace.namespace, stubFlow({ code: 0, stdout: '', stderr: '', timedOut: false }).namespace),
+      program: `
+const injected = [
+  'console', 'dispatchsubagent', 'exists', 'fetch', 'flow',
+  'process', 'processOrThrow', 'readTextFile', 'report', 'writeTextFile',
+]
+return {
+  flowKeys: Object.getOwnPropertyNames(flow).sort(),
+  traceType: typeof globalThis.trace,
+  hasTraceGlobal: Object.getOwnPropertyNames(globalThis).includes('trace'),
+  missing: injected.filter(name => typeof globalThis[name] === 'undefined'),
+}
+`,
+    })
+    assert.deepEqual(asJson(value), {
+      flowKeys: ['tmpDir'],
+      traceType: 'undefined',
+      hasTraceGlobal: false,
+      missing: [],
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+/**
+ * 预览有界且带 `truncated` 布尔：字符串截到 `PREVIEW_MAX_CHARS`，其余走 JSON、不可序列化回落成
+ * 类型名。界在事件里是硬的——`process` 的 stdout 可能很大，靠调用方自觉不是上界。
+ */
+test('参数与结果的预览有界并带上截断布尔', async () => {
+  const { root, tmpDir } = await makeRoots()
+  const trace = traceStub()
+  const flow = flowNamespace(
+    trace.namespace,
+    {
+      process: (): Promise<unknown> => Promise.resolve({ code: 0, stdout: 'z'.repeat(PREVIEW_MAX_CHARS * 3), stderr: '', timedOut: false }),
+      processOrThrow: (): Promise<unknown> => Promise.resolve({ stdout: '', stderr: '' }),
+      dispatchsubagent: (): Promise<undefined> => Promise.resolve(undefined),
+      report: (): Promise<null> => Promise.resolve(null),
+    },
+  )
+  try {
+    await runGuest({
+      tmpDir,
+      cwd: root,
+      flow,
+      program: [
+        "await report('short')",
+        `await report('y'.repeat(${String(PREVIEW_MAX_CHARS * 3)}))`,
+        "await process(['python', 'big'])",
+        "await dispatchsubagent('nothing')",
+      ].join('\n'),
+    })
+    const starts = trace.records.filter(record => record.phase === 'start')
+    const ends = trace.records.filter(record => record.phase === 'end')
+
+    // 短参数不截断；长参数截到上界并如实报出来。
+    assert.deepEqual(starts.map(record => [record.args, record.argsTruncated]), [
+      ['["short"]', false],
+      [`["${'y'.repeat(PREVIEW_MAX_CHARS - 2)}`, true],
+      ['[["python","big"]]', false],
+      ['["nothing"]', false],
+    ])
+    // 结果同理：`process` 的 stdout 很大，事件里只放得下上界那么多。
+    assert.deepEqual(ends.map(record => record.outcome), ['ok', 'ok', 'ok', 'ok'])
+    assert.equal(ends[2]?.textTruncated, true)
+    assert.equal(ends[2]?.text?.length, PREVIEW_MAX_CHARS)
+    assert.match(String(ends[2]?.text), /^\{"code":0,"stdout":"z+/)
+    // 不可序列化（这里是 `undefined`）回落成类型名，而不是把事件卡死。
+    assert.deepEqual([ends[3]?.text, ends[3]?.textTruncated], ['undefined', false])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+/**
+ * 界施加在**序列化之前**：`JSON.stringify` 会先把整份结果物化出来，之后才轮得到切 200 个字符——
+ * 一次 100MB 的 stdout 会先变成一整个 JSON 字符串，再被丢掉 99.99%。所以外壳先把值投影成有界的
+ * 等价物（长字符串截断、超长数组收窄、超过深度回落成类型名），再序列化它。
+ */
+test('超大结构在序列化之前就被投影收窄', async () => {
+  const { root, tmpDir } = await makeRoots()
+  const trace = traceStub()
+  const flow = flowNamespace(trace.namespace, {
+    process: (args: unknown): Promise<unknown> => {
+      const argv = (args as { argv: string[] }).argv
+      return Promise.resolve(argv[1] === 'wide'
+        ? { big: 'z'.repeat(PREVIEW_MAX_CHARS * 500), items: Array.from({ length: 500 }, (_, index) => index) }
+        : { a: { b: { c: { d: { beyond: 'x' } } } } })
+    },
+  })
+  try {
+    await runGuest({
+      tmpDir,
+      cwd: root,
+      flow,
+      program: [
+        "await process(['python', 'wide'])",
+        "await process(['python', 'deep'])",
+      ].join('\n'),
+    })
+    const ends = trace.records.filter(record => record.phase === 'end')
+    // 宽的那一条：长字符串与 500 个元素的数组都被收窄，预览仍然满上界并如实报截断。
+    assert.equal(ends[0]?.textTruncated, true)
+    assert.equal(ends[0]?.text?.length, PREVIEW_MAX_CHARS)
+    assert.match(String(ends[0]?.text), /^\{"big":"z+/)
+    // 深的那一条：投影丢过东西就算截断，哪怕投影后的 JSON 短得能整个放下——`truncated` 说的是
+    // "这不是原值"，不是"刚好占满 200 个字符"。
+    assert.equal(ends[1]?.textTruncated, true)
+    assert.match(String(ends[1]?.text), /"d":"object"/)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+/**
+ * 失败路径也必须闭合：不闭合的话面板上会留下一条永远在转的调用。错误文本同样有界。
+ */
+test('失败的原语调用也发 end，且带 outcome error', async () => {
+  const { root, tmpDir } = await makeRoots()
+  const trace = traceStub()
+  const flow = flowNamespace(trace.namespace, {
+    process: (): Promise<never> => Promise.reject(new Error('the run was cancelled')),
+  })
+  try {
+    let thrown = 'none'
+    try {
+      await runGuest({
+        tmpDir,
+        cwd: root,
+        flow,
+        program: "const r = await process(['python', 'x'])\nreturn r",
+      })
+    } catch (error: unknown) {
+      thrown = String((error as Error).message)
+    }
+    assert.equal(thrown, 'the run was cancelled')
+    assert.deepEqual(trace.records.map(record => [record.phase, record.member, record.line, record.outcome, record.text]), [
+      ['start', 'process', 1, undefined, undefined],
+      ['end', 'process', 1, 'error', 'Error: the run was cancelled'],
+    ])
+    assert.equal(trace.records[1]?.textTruncated, false)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+/**
+ * 并发调用可以**乱序闭合**：同一行上的两次调用，后发的那次先返回。到达顺序因此不足以配对，
+ * `callId` 才是判据（phase5-plan §4 的成对承诺，§9 的 R2）。
+ *
+ * 这条用例同时说明"宿主按到达顺序给 end 编号"为什么不行：两个 start 的 (member, line) 完全一样，
+ * 按到达顺序配会把 first 的耗时与结果记到 second 头上。
+ *
+ * 乱序由 stub 自己持有的 deferred 表达：`second` 立刻兑现，并在**它自己的续延里**放行 `first`。
+ * 那次续延先于外壳挂上的 `.then` 注册，所以 `second` 的 end 一定跑在 `first` 的前面——确定性来自
+ * promise 的续延顺序，不来自墙钟（`setTimeout(25)` 只是把结论押在机器有多快上）。
+ */
+test('并发调用乱序闭合时仍按 callId 成对', async () => {
+  const { root, tmpDir } = await makeRoots()
+  const trace = traceStub()
+  const resultOf = (name: string) => ({ code: 0, stdout: name, stderr: '', timedOut: false })
+  let releaseFirst: (value: unknown) => void = () => {}
+  const firstCall = new Promise<unknown>((resolve) => { releaseFirst = resolve })
+  const flow = flowNamespace(trace.namespace, {
+    process: (args: unknown): Promise<unknown> => {
+      const argv = (args as { argv: string[] }).argv
+      if (argv[1] === 'first') return firstCall
+      const settled = Promise.resolve(resultOf('second'))
+      // 这一条先于外壳注册它的续延，所以 end(second) 一定先于 end(first) 上报。
+      void settled.then(() => { releaseFirst(resultOf('first')) })
+      return settled
+    },
+  })
+  try {
+    await runGuest({
+      tmpDir,
+      cwd: root,
+      flow,
+      program: [
+        "const [slow, fast] = [process(['python', 'first']), process(['python', 'second'])]",
+        'await fast',
+        'await slow',
+        'return "both"',
+      ].join('\n'),
+    })
+    assert.deepEqual(
+      trace.records.map(record => [record.phase, record.callId, record.line]),
+      [
+        ['start', 0, 1],
+        ['start', 1, 1],
+        ['end', 1, 1],
+        ['end', 0, 1],
+      ],
+      '乱序闭合是允许的：配对靠 callId，到达顺序表达不了它',
+    )
+    // 配对是有内容的：每条 end 带回的是它自己那次调用的结果。
+    assert.equal(trace.records[2]?.text, '{"code":0,"stdout":"second","stderr":"","timedOut":false}')
+    assert.equal(trace.records[3]?.text, '{"code":0,"stdout":"first","stderr":"","timedOut":false}')
   } finally {
     await rm(root, { recursive: true, force: true })
   }

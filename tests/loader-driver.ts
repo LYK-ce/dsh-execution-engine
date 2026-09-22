@@ -37,6 +37,11 @@
  * - B12 取消后未投递的 `report` 不再投递：程序报三条然后去等一个长跑进程，取消返回时那三条已经从
  *   发起者的挂起队列里消失，而**上一次 run** 留下的两条原封不动（作废的范围是本次 run）；这一次的
  *   `flow/end` 因此带上 `discarded: 3`，上一次（正常跑完）是 `0`。
+ * - B13 执行位置上报（阶段 5）：`flow/call-start` 的 `line` 逐条等于程序里写死的行号（含循环里重复
+ *   出现的同一行）、`flow/call-start` 与 `flow/call-end` 按 `callId` 成对、失败调用也闭合且
+ *   `outcome === 'error'`、`flow/start.code` 是提交的正文原文，而内部 `trace` 通道不在程序可见面里。
+ *   取消一个正在 `await process(sleep)` 的程序时，那条再也没人能闭合的调用由宿主补发一条
+ *   `synthetic` 的 `flow/call-end`——而且它先于 `flow/end` 到达。
  *
  * 受限组合（`tests/fixtures/cordis-confined.yml`，workspace-write）：
  * - B5 `process` 起的外部进程过发起会话的文件策略：同一个程序里，写工作目录外的路径被
@@ -60,6 +65,7 @@ import { boot, resolveConfigPath } from '@deepseek-ai/dsh-app-boot'
 import type { JobId } from '@deepseek-ai/dsh-jobs'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { MessageId, UserMessage } from '@deepseek-ai/dsh-llm'
+import type { FlowCallEndEvent, FlowCallStartEvent, FlowStartEvent } from '../host/flow-events.ts'
 import { FAILURE_DIAGNOSTIC, FAILURE_MARKER, SCRIPTED_REPLY, scriptedStarts } from './fixtures/scripted-subagent-provider.ts'
 import * as plugin from '../host/index.ts'
 
@@ -632,9 +638,18 @@ return 'never'
     const flowStart: unknown[] = []
     const flowReport: unknown[] = []
     const flowEnd: unknown[] = []
-    ctx.on('flow/start', payload => { flowStart.push(payload) })
-    ctx.on('flow/report', payload => { flowReport.push(payload) })
-    ctx.on('flow/end', payload => { flowEnd.push(payload) })
+    const callStart: unknown[] = []
+    const callEnd: unknown[] = []
+    /**
+     * `flow/*` 的到达顺序（事件名 + run 身份）。B13 的"宿主补发的合成 `call-end` 先于 `flow/end`"
+     * 是**跨事件**的顺序判据，几个分开的数组表达不了它。
+     */
+    const flowOrder: Array<{ readonly name: string; readonly runId: string }> = []
+    ctx.on('flow/start', payload => { flowStart.push(payload); flowOrder.push({ name: 'flow/start', runId: String(payload.runId) }) })
+    ctx.on('flow/report', payload => { flowReport.push(payload); flowOrder.push({ name: 'flow/report', runId: String(payload.runId) }) })
+    ctx.on('flow/end', payload => { flowEnd.push(payload); flowOrder.push({ name: 'flow/end', runId: String(payload.runId) }) })
+    ctx.on('flow/call-start', payload => { callStart.push(payload); flowOrder.push({ name: 'flow/call-start', runId: String(payload.runId) }) })
+    ctx.on('flow/call-end', payload => { callEnd.push(payload); flowOrder.push({ name: 'flow/call-end', runId: String(payload.runId) }) })
 
     /**
      * 某一次 run 的事件。
@@ -691,11 +706,12 @@ return 'never'
       }
     }
 
-    const b11 = await startProgram(`
+    const b11Program = `
 await report('one')
 await report('two')
 return 'B11_DONE'
-`, reporter.agent)
+`
+    const b11 = await startProgram(b11Program, reporter.agent)
     const b11Output = await jobOutput(b11.jobId, reporter.agent)
     assertProgramSucceeded(b11Output, 'B11')
     assert.equal(returned(b11Output), 'B11_DONE')
@@ -709,9 +725,10 @@ return 'B11_DONE'
     )
     const b11PendingIds = reporter.pending.map(message => message.id)
 
-    // 判据 2：三个 observe-only 事件都发全了，而且带的是同一个 run 身份。
+    // 判据 2：三个 observe-only 事件都发全了，而且带的是同一个 run 身份。程序正文随启动事件一起发
+    // （阶段 5），逐字就是提交的那一份。
     assert.deepEqual(eventsOf(flowStart, b11.jobId), [
-      { runId: b11.jobId, label: "await report('one')", ownerSession: reporter.agent.id },
+      { runId: b11.jobId, label: "await report('one')", ownerSession: reporter.agent.id, code: b11Program },
     ])
     assert.deepEqual(eventsOf(flowReport, b11.jobId), [
       { runId: b11.jobId, text: 'one' },
@@ -757,6 +774,158 @@ return 'B12_DONE'
       detail: 'cancelled by the initiating agent',
     }])
     process.stdout.write('B12 undelivered reports are discarded on cancel: OK\n')
+
+    // ---- B13：执行位置上报（阶段 5） -------------------------------------------
+    // 行号判据写死，不用"大于 0"：下面的数组就是行号表，每条原语调用对照它在数组里的位置
+    // （1-based）。`lineOffset: -1` 抵掉编译包装那一行前缀，所以栈里的行号就是这里的行号。
+    const b13Program = [
+      "const ok = await process(['python', '-c', 'print(1)'])",                  // 1
+      "await report('b13')",                                                     // 2
+      'for (let index = 0; index < 3; index++) {',                               // 3
+      "  await process(['python', '-c', 'print(2)'])",                           // 4
+      '}',                                                                       // 5
+      'let failed = "none"',                                                     // 6
+      'try {',                                                                   // 7
+      "  await processOrThrow(['python', '-c', 'import sys; sys.exit(3)'])",     // 8
+      '} catch (error) {',                                                       // 9
+      '  failed = String(error && error.message)',                               // 10
+      '}',                                                                       // 11
+      'return {',                                                                // 12
+      '  code: ok.code,',                                                        // 13
+      '  failed,',                                                               // 14
+      '  visible: Object.getOwnPropertyNames(globalThis),',                      // 15
+      '  flowKeys: Object.getOwnPropertyNames(flow).join(","),',                 // 16
+      '}',                                                                       // 17
+    ].join('\n')
+    const traced = await makeAgent('traced')
+    const b13 = await startProgram(b13Program, traced.agent)
+    const b13Output = await jobOutput(b13.jobId, traced.agent)
+    assertProgramSucceeded(b13Output, 'B13')
+    const b13Value = returned(b13Output) as {
+      code: number
+      failed: string
+      visible: string[]
+      flowKeys: string
+    }
+    assert.equal(b13Value.code, 0, 'B13: the first process must have run')
+    assert.match(b13Value.failed, /exited with code 3/, 'B13: the failing processOrThrow must have thrown')
+
+    // 判据 6：程序可见面没变——内部 `trace` 通道不在里面，`flow` 上仍然只有 `tmpDir`。
+    assert.equal(
+      b13Value.visible.includes('trace'),
+      false,
+      'B13: the internal trace channel must not be program-visible',
+    )
+    assert.equal(b13Value.flowKeys, 'tmpDir', 'B13: the visible flow namespace must still only carry tmpDir')
+
+    // 判据 1：行号写死比对。循环里同一行出现三次，所以 process 在源码第 4 行上出现三次——
+    // 重复是正常的，不去重（design.md §8.3 的"轨迹"要的就是这个）。
+    await waitFor(
+      () => eventsOf(callStart, b13.jobId).length >= 6 && eventsOf(callEnd, b13.jobId).length >= 6,
+      20_000,
+      'B13',
+    )
+    const b13Starts = eventsOf(callStart, b13.jobId) as FlowCallStartEvent[]
+    const b13Ends = eventsOf(callEnd, b13.jobId) as FlowCallEndEvent[]
+    assert.deepEqual(
+      b13Starts.map(event => [event.member, event.line]),
+      [
+        ['process', 1],
+        ['report', 2],
+        ['process', 4],
+        ['process', 4],
+        ['process', 4],
+        ['processOrThrow', 8],
+      ],
+      'B13: every reported line must equal its line in the submitted program',
+    )
+
+    // 判据 2：成对——数量相等、(member, line) 序列一致、callId 一一对应且互不相同。
+    assert.equal(b13Ends.length, b13Starts.length, 'B13: every call-start must be closed by exactly one call-end')
+    assert.deepEqual(
+      b13Ends.map(event => [event.member, event.line]),
+      b13Starts.map(event => [event.member, event.line]),
+      'B13: call-end must report the same member and line as its call-start',
+    )
+    assert.deepEqual(
+      b13Ends.map(event => event.callId),
+      b13Starts.map(event => event.callId),
+      'B13: call-end must close its own call-start (same callId), not just any open one',
+    )
+    assert.equal(
+      new Set(b13Starts.map(event => event.callId)).size,
+      b13Starts.length,
+      'B13: call ids must be unique inside one run',
+    )
+
+    // 判据 4：失败路径也闭合，且分类是 error（`processOrThrow` 的非零退出码）。
+    assert.deepEqual(
+      b13Ends.map(event => event.outcome),
+      ['ok', 'ok', 'ok', 'ok', 'ok', 'error'],
+      'B13: only the failing processOrThrow may end as an error',
+    )
+    assert.match(String(b13Ends[5]?.error), /exited with code 3/)
+    assert.equal(b13Ends[5]?.result, undefined, 'B13: a failed call must not carry a result')
+
+    // 判据 3（预览面）：参数与结果都在事件里，且有界标记在场。
+    assert.deepEqual(b13Starts.map(event => event.argsTruncated), [false, false, false, false, false, false])
+    assert.match(String(b13Starts[0]?.args), /\[\["python","-c","print\(1\)"\]\]/)
+    assert.match(String(b13Ends[0]?.result), /"code":0/)
+    for (const event of b13Ends) assert.ok(event.ms >= 0, 'B13: every call-end must report a non-negative duration')
+
+    // 判据 5：程序源码是提交的正文原文。
+    const b13StartsOfRun = eventsOf(flowStart, b13.jobId) as FlowStartEvent[]
+    assert.equal(b13StartsOfRun.length, 1, 'B13: the run must announce exactly one start')
+    assert.equal(b13StartsOfRun[0]?.code, b13Program, 'B13: flow/start must carry the submitted program verbatim')
+    process.stdout.write(
+      `B13 primitive call lines, pairing and code on flow/start: OK (${String(b13Starts.length)} calls traced)\n`,
+    )
+
+    // 判据 7（阶段 5 修复，应修 A）：取消一个**正在 await process** 的程序。取消在 PTC 里是"先关
+    // channel、再杀 guest"，在飞调用那条 `.then` 再也跑不到——那条 start 的 end 只能由宿主补发，
+    // 否则阶段 6 的面板上会留下一条永远在转的调用。
+    const b13PendingProgram = `
+const r = await process(['python', '-c', 'import time; time.sleep(60)'])
+return r.code
+`
+    const b13Pending = await startProgram(b13PendingProgram, traced.agent)
+    await waitFor(() => eventsOf(callStart, b13Pending.jobId).length >= 1, 20_000, 'B13-cancel')
+    const b13PendingCancel = await callCancelProgram(traced.agent)
+    assert.equal(
+      b13PendingCancel.isError,
+      false,
+      `B13: cancelling the pending program failed: ${textOf(b13PendingCancel)}`,
+    )
+    assert.equal((b13PendingCancel.value as { status?: string }).status, 'killed', 'B13: the pending program must be killed')
+    await waitFor(
+      () => eventsOf(callEnd, b13Pending.jobId).length >= 1 && eventsOf(flowEnd, b13Pending.jobId).length >= 1,
+      20_000,
+      'B13-cancel',
+    )
+
+    const pendingStarts = eventsOf(callStart, b13Pending.jobId) as FlowCallStartEvent[]
+    const pendingEnds = eventsOf(callEnd, b13Pending.jobId) as FlowCallEndEvent[]
+    assert.equal(pendingStarts.length, 1, 'B13: the cancelled program must have traced exactly one call')
+    assert.equal(pendingEnds.length, 1, 'B13: the host must close the call the guest could not')
+    assert.equal(
+      pendingEnds[0]?.callId,
+      pendingStarts[0]?.callId,
+      'B13: the synthetic end must close that call (same callId), not just any open one',
+    )
+    assert.equal(pendingEnds[0]?.outcome, 'error', 'B13: a call the host had to close reports an error outcome')
+    assert.equal(pendingEnds[0]?.synthetic, true, 'B13: the host-synthesized closure must say so')
+    assert.match(
+      String(pendingEnds[0]?.error),
+      /the program ended before this call settled/,
+      'B13: the synthetic end must explain why it exists',
+    )
+    // 面板要先看到所有调用闭合，再看到 run 结束：合成 end 必须发在 `flow/end` 之前。
+    const pendingOrder = flowOrder.filter(entry => entry.runId === b13Pending.jobId).map(entry => entry.name)
+    assert.ok(
+      pendingOrder.indexOf('flow/call-end') < pendingOrder.indexOf('flow/end'),
+      `B13: the synthetic end must arrive before flow/end, got ${JSON.stringify(pendingOrder)}`,
+    )
+    process.stdout.write('B13 cancel closes an in-flight call with a synthetic end: OK\n')
   } else {
     // ---- B5：受限组合——工作目录外的写被策略拒绝，工作目录内的写成功 -----------
     // 两条用例在同一个程序、同一个 `process` 绑定、同一份策略下跑同一段 python 脚本，

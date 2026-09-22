@@ -399,7 +399,10 @@ test('flow/* 事件：启动、report、结束都以 run 身份关联', async ()
 
   const id = programs.start(request(owner.owner, 'return 1'))
   assert.deepEqual(host.events.map(event => event.name), ['flow/start'])
-  assert.deepEqual(host.events[0]?.args, [{ runId: id, label: 'return 1', ownerSession: 'owner-a' }])
+  // 程序正文随启动事件一起发：调用事件的 `line` 指的就是它的行号（阶段 5）。
+  assert.deepEqual(host.events[0]?.args, [
+    { runId: id, label: 'return 1', ownerSession: 'owner-a', code: 'return 1' },
+  ])
 
   deliverReports(control, owner)
   assert.deepEqual(
@@ -430,4 +433,168 @@ test('flow/* 是 observe-only：监听者抛异常只记一条警告，不影响
   assert.equal(host.warnings.length, 1)
   assert.match(host.warnings[0] ?? '', /flow\/\* listener threw/)
   assert.match(host.warnings[0] ?? '', /listener for flow\/start threw/)
+})
+
+/**
+ * 阶段 5 的身份补全点：外壳的上报只带调用自己的字段，run 身份由这里补。
+ * 顺序与配对是**到达顺序**说了算的——外壳按调用发生顺序发，宿主同步转发，所以先到的 start
+ * 一定先到（`host/guest-source.ts` 的包装函数）。
+ */
+test('原语调用上报补上 run 身份，start 与 end 按 callId 成对', () => {
+  const host = fakeHost()
+  const control = controllableRun()
+  const programs = createProgramJobs(host.ctx, control.run)
+  const owner = agent('owner-a')
+
+  const id = programs.start(request(owner, 'return 1'))
+  const trace = control.requests[0]?.trace
+  assert.ok(trace !== undefined, 'the producer must hand the run its trace sink')
+
+  trace.start({ callId: 0, member: 'process', line: 3, args: '[["python"]]', argsTruncated: false })
+  trace.end({ callId: 0, member: 'process', line: 3, ms: 12, outcome: 'ok', result: '{"code":0}', resultTruncated: false })
+  // 失败路径也闭合：不发 end 的话面板上会留下一条永远在转的调用。
+  trace.start({ callId: 1, member: 'report', line: null, args: '["x"]', argsTruncated: false })
+  trace.end({ callId: 1, member: 'report', line: null, ms: 1, outcome: 'error', error: 'the run was cancelled', errorTruncated: false })
+
+  assert.deepEqual(
+    host.events.filter(event => event.name.startsWith('flow/call')).map(event => [event.name, event.args[0]]),
+    [
+      ['flow/call-start', { runId: id, callId: 0, member: 'process', line: 3, args: '[["python"]]', argsTruncated: false }],
+      ['flow/call-end', { runId: id, callId: 0, member: 'process', line: 3, ms: 12, outcome: 'ok', result: '{"code":0}', resultTruncated: false }],
+      ['flow/call-start', { runId: id, callId: 1, member: 'report', line: null, args: '["x"]', argsTruncated: false }],
+      ['flow/call-end', { runId: id, callId: 1, member: 'report', line: null, ms: 1, outcome: 'error', error: 'the run was cancelled', errorTruncated: false }],
+    ],
+  )
+})
+
+/**
+ * run 终止时仍未闭合的调用由宿主补一条合成的 `flow/call-end`（应修 A）。
+ *
+ * `flow/call-end` **只**由 guest 侧那条 `.then` 发出（`host/guest-source.ts` 的 `wrap`），而取消与
+ * 超时在 PTC 里是"先关 channel、再杀 guest"：在飞的调用再也回不到 `.then`，那条 start 就永远没有
+ * end。程序不 `await` 一个调用就 `return` 同理。合成事件必须发在 `flow/end` **之前**——面板要先
+ * 看到所有调用闭合，再看到 run 结束。
+ */
+test('run 终止时给未闭合的调用补发合成的 call-end，且在 flow/end 之前', async () => {
+  const host = fakeHost()
+  const control = controllableRun()
+  const programs = createProgramJobs(host.ctx, control.run)
+  const owner = agent('owner-a')
+
+  programs.start(request(owner, 'return 1'))
+  const trace = control.requests[0]?.trace
+  assert.ok(trace !== undefined, 'the producer must hand the run its trace sink')
+
+  // 一条正常闭合的调用 + 一条被取消吃掉的调用（start 发了，end 永远不来）。
+  trace.start({ callId: 0, member: 'process', line: 2, args: '[["python"]]', argsTruncated: false })
+  trace.end({ callId: 0, member: 'process', line: 2, ms: 5, outcome: 'ok', result: 'null', resultTruncated: false })
+  trace.start({ callId: 1, member: 'report', line: 3, args: '["x"]', argsTruncated: false })
+
+  const cancelled = programs.cancel(owner)
+  control.pending[0]?.({ output: '程序执行失败（abort）：cancelled', status: 'failed' })
+  await cancelled
+  const submission = host.submissions[0]
+  assert.ok(submission !== undefined)
+  await submission.hooks.done
+
+  // 顺序就是面板要看的那一段：两条 start 各自闭合之后，run 才结束。
+  assert.deepEqual(host.events.map(event => event.name), [
+    'flow/start',
+    'flow/call-start',
+    'flow/call-end',
+    'flow/call-start',
+    'flow/call-end',
+    'flow/end',
+  ])
+
+  const ends = host.events.filter(event => event.name === 'flow/call-end').map(event => event.args[0]) as Array<Record<string, unknown>>
+  // 程序自己报的那条 end 不带 synthetic（字段在场**就是**合成的）。
+  assert.equal(ends[0]?.synthetic, undefined)
+  const synthetic = ends[1]
+  assert.equal(synthetic?.synthetic, true, 'the closure of a call the guest never settled must be marked synthetic')
+  assert.equal(synthetic?.callId, 1, 'the synthetic end must close the call that is still open')
+  assert.equal(synthetic?.member, 'report')
+  assert.equal(synthetic?.line, 3, 'the synthetic end must keep the call site of its start')
+  assert.equal(synthetic?.outcome, 'error')
+  assert.equal(synthetic?.result, undefined, 'a failed call must not carry a result')
+  assert.equal(synthetic?.error, 'the program ended before this call settled (cancelled by the initiating agent)')
+  assert.equal(synthetic?.errorTruncated, false)
+  // 耗时是宿主这一侧从收到 start 到 run 终止的时间：guest 那一侧的计时器已经没了。
+  assert.equal(typeof synthetic?.ms, 'number')
+  assert.ok((synthetic?.ms as number) >= 0)
+  assert.equal(ends.length, 2, 'a settled call must not get a second, synthetic end')
+})
+
+/**
+ * 补发不只在取消路径上：程序不 `await` 一个调用就 `return` 时，run 正常跑完，而 guest 已经关掉
+ * channel 退场，那条 `.then` 一样不会跑。判据挂在**终态**上，所以 `completed` 也要补。
+ */
+test('程序正常跑完但留下未闭合的调用时，同样补发合成 end', async () => {
+  const host = fakeHost()
+  const control = controllableRun()
+  const programs = createProgramJobs(host.ctx, control.run)
+  const owner = agent('owner-a')
+
+  programs.start(request(owner, 'return 1'))
+  const trace = control.requests[0]?.trace
+  assert.ok(trace !== undefined, 'the producer must hand the run its trace sink')
+  // 起了但没 await：程序带着一个在飞的调用返回。
+  trace.start({ callId: 0, member: 'process', line: 1, args: '[["python"]]', argsTruncated: false })
+
+  control.pending[0]?.({ output: 'done', status: 'completed' })
+  const submission = host.submissions[0]
+  assert.ok(submission !== undefined)
+  await submission.hooks.done
+
+  const ends = host.events.filter(event => event.name === 'flow/call-end').map(event => event.args[0]) as Array<Record<string, unknown>>
+  assert.equal(ends.length, 1)
+  assert.equal(ends[0]?.synthetic, true)
+  assert.equal(ends[0]?.error, 'the program ended before this call settled (completed)')
+  assert.deepEqual(host.events.map(event => event.name), ['flow/start', 'flow/call-start', 'flow/call-end', 'flow/end'])
+})
+
+/**
+ * run 身份读不到时**放弃这条观察事件并记一声**，而不是抛出去。
+ *
+ * 抛出去只会经绑定被 guest 的 `ignoreRejection` 吞掉：既没有事件、也没有日志，面板上看到的是
+ * "这次调用什么都没发生"。真实的时序里第一次上报最早也只能发生在 job id 就位之后，
+ * 所以这条兜底路径不可达；这里在 `run()` 里（id 还没回来）故意调一次把它逼出来。
+ */
+test('run 身份还不在场时放弃事件并记一条警告，不把异常丢给 guest', () => {
+  const host = fakeHost()
+  const owner = agent('owner-a')
+  const programs = createProgramJobs(host.ctx, (runRequest) => {
+    runRequest.trace.start({ callId: 0, member: 'process', line: 1, args: '[]', argsTruncated: false })
+    runRequest.reports.record('report-0' as unknown as MessageId, 'one')
+    return new Promise<RunProgramOutcome>(() => {})
+  })
+
+  assert.doesNotThrow(
+    () => programs.start(request(owner, 'return 1')),
+    'a missing run identity must not turn into a rejection the guest silently swallows',
+  )
+  assert.deepEqual(host.events.map(event => event.name), ['flow/start'], 'an observation without a run identity must not be emitted')
+  assert.deepEqual(host.warnings, [
+    'execution-engine: dropping a primitive call report: this run has no job id yet',
+    'execution-engine: dropping a delivered report: this run has no job id yet',
+  ])
+})
+
+test('原语调用上报也是 observe-only：监听者抛异常只记一条警告', () => {
+  const host = fakeHost('flow/call-end')
+  const control = controllableRun()
+  const programs = createProgramJobs(host.ctx, control.run)
+  const owner = agent('owner-a')
+
+  programs.start(request(owner, 'return 1'))
+  const trace = control.requests[0]?.trace
+  assert.ok(trace !== undefined, 'the producer must hand the run its trace sink')
+
+  // 上报是 fire-and-forget 的，宿主侧再抛出去就是一个没人接收的 rejection，所以必须收住。
+  assert.doesNotThrow(() => {
+    trace.start({ callId: 0, member: 'process', line: 3, args: '[]', argsTruncated: false })
+    trace.end({ callId: 0, member: 'process', line: 3, ms: 1, outcome: 'ok', result: 'null', resultTruncated: false })
+  })
+  assert.equal(host.warnings.length, 1)
+  assert.match(host.warnings[0] ?? '', /listener for flow\/call-end threw/)
 })

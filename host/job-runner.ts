@@ -17,16 +17,23 @@
  *   `hooks.cancel`，所以判据挂在**终态**上而不是挂在 `cancel()` 上。摘的动作自己也收住异常：owner
  *   已被 dispose 时收件箱投影已经注销，摘会抛而不是返回 `false`（见 `discardPending`）。
  *
+ * 阶段 5 起它还是 `flow/*` 的**身份补全点**：外壳的原语调用上报折成的事件只带调用自己的字段，
+ * run 身份由这里补（`runIdentity`），因为 job id 只有持有单例槽位的这里拿得到。程序正文也随
+ * `flow/start` 一起发出去——调用事件的 `line` 指的就是它的行号。它还是未闭合调用的**补发点**：
+ * run 结算时给取消/超时/未 await 而失去 `flow/call-end` 的调用补一条合成的 `end`
+ * （{@link FlowCallSink.closeOpenCalls}），再发 `flow/end`。
+ *
  * 本模块**不引入任何运行时依赖**：跨包一律 `import type`，`runProgram` 由装配方注入，所以纯 Node
  * 的 `pnpm run test` 能直接加载它（phase1-plan §10 A 档）。
  * @module dsh-execution-engine/job-runner
  */
 
+import { performance } from 'node:perf_hooks'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { JobHooks, JobId, JobOutcome } from '@deepseek-ai/dsh-jobs'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import type { RunProgramOutcome, RunProgramRequest } from './engine.ts'
+import type { FlowCallSink, RunProgramOutcome, RunProgramRequest } from './engine.ts'
 // 仅类型：`JobKindMap` 与 `Events`（`flow/*`）两个合并入口，本模块的 `kind` 与 `ctx.emit` 靠它们
 // 才成立。
 import type {} from './jobs-types.ts'
@@ -41,14 +48,14 @@ const LABEL_MAX_LENGTH = 80
 const CANCEL_REASON = 'cancelled by the initiating agent'
 
 /**
- * 一次 `run_program` 的提交请求：`RunProgramRequest` 去掉 `signal` 与 `reports`。
+ * 一次 `run_program` 的提交请求：`RunProgramRequest` 去掉 `signal`、`reports` 与 `trace`。
  *
- * 这两个 `Omit` 是设计的一部分，不是省事：主 agent 取消**一轮 turn**（`ToolRunContext.signal`）
+ * 这三个 `Omit` 是设计的一部分，不是省事：主 agent 取消**一轮 turn**（`ToolRunContext.signal`）
  * 不该杀掉后台程序——"绑的是 agent 实例的生命周期，不是 turn"（design.md §5.3）。所以程序的
- * 取消信号只有一个来源，就是提交时为它新建的那个 controller。`reports` 同理：记账的范围是一次
- * job，只有持有单例槽位的这里造得出来。
+ * 取消信号只有一个来源，就是提交时为它新建的那个 controller。`reports` 与 `trace` 同理：两者的
+ * 作用域都是一次 job，而 run 身份（job id）也只有持有单例槽位的这里拿得到。
  */
-export type ProgramRequest = Omit<RunProgramRequest, 'signal' | 'reports'>
+export type ProgramRequest = Omit<RunProgramRequest, 'signal' | 'reports' | 'trace'>
 
 /**
  * `runProgram` 的入口。由装配方注入而不是直接 import：`host/engine.ts` 在运行时拉进
@@ -134,18 +141,63 @@ export function createProgramJobs(ctx: Context, execute: ProgramExecute): Progra
 
       // 本次 run 的 report 记账与 `flow/*` 发射点。run 身份（job id）要等 `ctx.jobs.start` 返回才有，
       // 所以这里先声明、拿到 id 之后立刻填；第一次投递最早也只能发生在那一刻之后——`runProgram`
-      // 先 await 建临时目录，再把绑定交给 PTC。填不上就是这段时序被改坏了，直接抛。
+      // 先 await 建临时目录，再把绑定交给 PTC。填不上就是这段时序被改坏了：记一条警告、放弃这条
+      // 观察事件（`runIdentity`）。
       let runId: JobId | undefined
       const reports = createReportLedger({
         onDelivered: ({ text }) => {
-          // 窄化在闭包里不保留，所以先取出来后按这个常量发射。
-          const identity = runId
-          if (identity === undefined) {
-            throw new Error('execution-engine: a report was delivered before this run had a job id')
-          }
+          const identity = runIdentity(ctx, runId, 'delivered report')
+          if (identity === undefined) return
           emitFlow(ctx, () => { ctx.emit('flow/report', { runId: identity, text }) })
         },
       })
+      // 阶段 5：外壳的原语调用上报。与 report 同一时序约束，所以同样在发射的那一刻读 `runId`。
+      //
+      // 未闭合调用的记账写在这里，不从别处借一个工厂：`flow/call-end` **只**由 guest 侧那条
+      // `.then` 发出（`host/guest-source.ts` 的 `wrap`），而 PTC 的 `finish` 对每一种结局都先
+      // `channel?.close()` 再 `handle.terminate()`
+      // （`packages/ptc-runtime/ptc-runtime-node/src/index.ts:165-199`）——取消、超时，以及程序不
+      // `await` 一个调用就 `return`，都会让那条 `.then` 永远不跑。槽位与 run 终态都在本模块，而
+      // 本模块不许有运行时依赖（模块头第 4 条），`host/engine.ts` 在运行时拉进 `@deepseek-ai/dsh-llm`。
+      const openCalls = new Map<number, { readonly member: string; readonly line: number | null; readonly startedAt: number }>()
+      const trace: FlowCallSink = {
+        start: (call) => {
+          const identity = runIdentity(ctx, runId, 'primitive call report')
+          if (identity === undefined) return
+          // 合成 `end` 的耗时从**宿主**收到 start 的那一刻算起：guest 那一侧的计时器已经随它一起没了。
+          openCalls.set(call.callId, { member: call.member, line: call.line, startedAt: performance.now() })
+          emitFlow(ctx, () => { ctx.emit('flow/call-start', { runId: identity, ...call }) })
+        },
+        end: (call) => {
+          const identity = runIdentity(ctx, runId, 'primitive call report')
+          if (identity === undefined) return
+          openCalls.delete(call.callId)
+          emitFlow(ctx, () => { ctx.emit('flow/call-end', { runId: identity, ...call }) })
+        },
+        closeOpenCalls: (termination) => {
+          const identity = runIdentity(ctx, runId, 'synthetic primitive call closure')
+          if (identity === undefined || openCalls.size === 0) return
+          const now = performance.now()
+          // 先取快照再清空：合成的 end 经 `emit` 同步发出去，重入的 start 不该被这一轮补发吃掉。
+          const unclosed = [...openCalls]
+          openCalls.clear()
+          for (const [callId, call] of unclosed) {
+            emitFlow(ctx, () => {
+              ctx.emit('flow/call-end', {
+                runId: identity,
+                callId,
+                member: call.member,
+                line: call.line,
+                ms: Math.max(0, Math.round(now - call.startedAt)),
+                outcome: 'error',
+                error: `the program ended before this call settled (${termination})`,
+                errorTruncated: false,
+                synthetic: true,
+              })
+            })
+          }
+        },
+      }
       const label = programLabel(request.code)
 
       // `run()` 在 `ctx.jobs.start` 返回 id 之前被同步调用，此时还没有 id 可记，所以 hooks
@@ -161,7 +213,7 @@ export function createProgramJobs(ctx: Context, execute: ProgramExecute): Progra
           const controller = new AbortController()
           const hooks: JobHooks = {
             cancel: (reason) => { controller.abort(reason) },
-            done: toJobOutcome(execute({ ...request, signal: controller.signal, reports }), controller),
+            done: toJobOutcome(execute({ ...request, signal: controller.signal, reports, trace }), controller),
           }
           slot.hooks = hooks
           return hooks
@@ -190,6 +242,12 @@ export function createProgramJobs(ctx: Context, execute: ProgramExecute): Progra
         // 摘的条数进 `flow/end`：观察面要能把"报出去了"（`flow/report`）和"真的被读到了"对齐，
         // 只发前者的话，阶段 6 的面板重建不出哪些 report 被这次取消吃掉了。
         const discarded = outcome.status === 'killed' ? discardPending(ctx, reports, owner) : 0
+        // 每个原语调用都恰好配一对（`flow-events.ts` 的成对承诺）。`flow/call-end` 由 guest 侧那条
+        // `.then` 发出，而取消、超时、以及"不 await 就 return"都会让 guest 先死掉——那些在飞的调用
+        // 只能在这里闭合。必须在 `flow/end` **之前**：面板要先看到所有调用闭合，再看到 run 结束。
+        // 到这里 guest 已经不在（`done` 在 `runProgram` 的 finally 里等过在飞的上报），所以集合里剩
+        // 下的都是真的不会再有 `end` 的。
+        trace.closeOpenCalls(outcome.detail ?? outcome.status)
         emitFlow(ctx, () => {
           ctx.emit('flow/end', {
             runId: jobId,
@@ -200,7 +258,9 @@ export function createProgramJobs(ctx: Context, execute: ProgramExecute): Progra
         })
       })
       emitFlow(ctx, () => {
-        ctx.emit('flow/start', { runId: jobId, label, ownerSession: owner.id })
+        // 程序正文随 `flow/start` 一起发：调用事件的 `line` 指的就是这份正文的行号，面板要它才对得上
+        // （design.md §8.2；行结构的保证见 `host/capabilities.ts` 的 `stripUserProgram`）。
+        ctx.emit('flow/start', { runId: jobId, label, ownerSession: owner.id, code: request.code })
       })
       return jobId
     },
@@ -221,6 +281,27 @@ export function createProgramJobs(ctx: Context, execute: ProgramExecute): Progra
       }
     },
   }
+}
+
+/**
+ * 读本次提交的 run 身份；读不到就记一条警告并**放弃这条观察事件**。
+ *
+ * run 身份要等 `ctx.jobs.start` 返回才有，而 `run()` 是在它返回**之前**被同步调用的；不过
+ * `runProgram` 先 await 建临时目录、再把绑定交给 PTC，所以第一次投递与第一次上报最早也只能发生在
+ * 那一行之后。读不到就是这段时序被改坏了：这时**只记一声**、不发事件——发一条没有身份的观察事件
+ * 会让面板把两条不同 run 的轨迹拼在一起，而抛出去只会被 guest 的 `ignoreRejection` 吞掉，
+ * 变成既没有事件也没有日志的静默缺口（`host/guest-source.ts` 的 `trace`）。
+ * @param ctx - 宿主上下文；这条警告从这里出。
+ * @param runId - `start` 闭包里的 run 身份；提交填好之前是 `undefined`。
+ * @param subject - 出错时点名的动作，写成一个名词短语（`primitive call report`）。
+ * @returns 同一个身份；这次提交还没有身份时是 `undefined`，调用方据此跳过这次发射。
+ */
+function runIdentity(ctx: Context, runId: JobId | undefined, subject: string): JobId | undefined {
+  if (runId === undefined) {
+    ctx.logger.warn(`execution-engine: dropping a ${subject}: this run has no job id yet`)
+    return undefined
+  }
+  return runId
 }
 
 /**
