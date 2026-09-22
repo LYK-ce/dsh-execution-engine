@@ -3,14 +3,15 @@ import { test } from 'node:test'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { JobHooks, JobId, JobStart } from '@deepseek-ai/dsh-jobs'
+import type { MessageId } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import type { RunProgramOutcome } from '../host/engine.ts'
+import type { RunProgramOutcome, RunProgramRequest } from '../host/engine.ts'
 import { createProgramJobs, programLabel } from '../host/job-runner.ts'
 import type { ProgramExecute, ProgramRequest } from '../host/job-runner.ts'
 
 /**
- * 用假 `ctx.jobs` 覆盖记账的三条契约（phase3-plan §8）：单例拒绝、`cancel` 同步且幂等、
- * 记账在 `done` 之后才清。
+ * 用假 `ctx.jobs` 覆盖记账的四条契约（phase3-plan §8、phase4-plan §3–§4）：单例拒绝、`cancel`
+ * 同步且幂等、记账在 `done` 之后才清、取消路径作废未投递的 report 并发出 `flow/*`。
  *
  * 本文件是纯 Node 的 `pnpm run test` 直接加载的，所以跨包一律 `import type`：
  * `@deepseek-ai/dsh-jobs` 与 `@deepseek-ai/dsh-session` 在纯 Node 下没有解析路径。
@@ -21,6 +22,23 @@ function agent(id: string): Agent {
   return { id: id as unknown as SessionId } as unknown as Agent
 }
 
+/** 一个带收件箱的发起者：`report` 记账的作废只用到 `Inbox.remove`。 */
+function inboxOwner(id: string): { owner: Agent; pending: string[] } {
+  const pending: string[] = []
+  const owner = {
+    id: id as unknown as SessionId,
+    inbox: {
+      remove(messageId: MessageId): boolean {
+        const index = pending.indexOf(String(messageId))
+        if (index < 0) return false
+        pending.splice(index, 1)
+        return true
+      },
+    },
+  } as unknown as Agent
+  return { owner, pending }
+}
+
 /** 一次被假注册表收下的提交。 */
 interface FakeSubmit {
   readonly id: JobId
@@ -28,13 +46,22 @@ interface FakeSubmit {
   readonly hooks: JobHooks
 }
 
+/** 一次被假宿主收下的 `flow/*` 发射。 */
+interface FakeEvent {
+  readonly name: string
+  readonly args: readonly unknown[]
+}
+
 /**
- * 假的宿主：`ctx.jobs` 只需要 `start`，`ctx.effect` 用来模拟插件卸载。
- * @returns 假上下文、收下的提交，以及跑一遍 effect disposer 的 `unwatch`。
+ * 假的宿主：`ctx.jobs` 只需要 `start`，`ctx.emit` 收 `flow/*`，`ctx.effect` 模拟插件卸载。
+ * @param throwOn - 让这个事件名的发射抛一次，用来验证监听者的异常被收住。
+ * @returns 假上下文、收下的提交与事件、告警，以及跑一遍 effect disposer 的 `unwatch`。
  */
-function fakeHost() {
+function fakeHost(throwOn?: string) {
   const submissions: FakeSubmit[] = []
   const disposers: Array<() => void | Promise<void>> = []
+  const events: FakeEvent[] = []
+  const warnings: string[] = []
   const ctx = {
     jobs: {
       start(spec: JobStart): JobId {
@@ -43,6 +70,15 @@ function fakeHost() {
         const id = `${spec.kind}-${String(submissions.length + 1)}` as unknown as JobId
         submissions.push({ id, spec, hooks })
         return id
+      },
+    },
+    emit(name: string, ...args: unknown[]): void {
+      events.push({ name, args })
+      if (name === throwOn) throw new Error(`listener for ${name} threw`)
+    },
+    logger: {
+      warn(message: string): void {
+        warnings.push(message)
       },
     },
     effect(callback: () => () => void | Promise<void>): () => void {
@@ -54,6 +90,8 @@ function fakeHost() {
   return {
     ctx,
     submissions,
+    events,
+    warnings,
     /** 模拟插件卸载：跑一遍登记在上下文上的 effect disposer，并等它们收尾。 */
     async unwatch(): Promise<void> {
       for (const dispose of disposers.splice(0)) await dispose()
@@ -79,12 +117,14 @@ function tick(): Promise<void> {
  */
 function controllableRun() {
   const signals: AbortSignal[] = []
+  const requests: RunProgramRequest[] = []
   const pending: Array<(outcome: RunProgramOutcome) => void> = []
   const run: ProgramExecute = (runRequest) => {
     signals.push(runRequest.signal)
+    requests.push(runRequest)
     return new Promise<RunProgramOutcome>((resolve) => { pending.push(resolve) })
   }
-  return { run, signals, pending }
+  return { run, signals, requests, pending }
 }
 
 test('start 同步返回 job id，不等程序跑完', () => {
@@ -255,4 +295,139 @@ test('插件 dispose 先取消在跑的程序、等它结算，再清记账', as
     () => programs.start(request(owner, 'return 2')),
     '结算之后记账必须被释放',
   )
+})
+
+/** 往一次 run 的记账里放两条 report，并把它们摆成"还挂在发起者队列里"。 */
+function deliverReports(control: ReturnType<typeof controllableRun>, owner: { pending: string[] }): void {
+  const reports = control.requests[0]?.reports
+  assert.ok(reports !== undefined, 'the producer must hand the run its report ledger')
+  for (const [index, text] of ['one', 'two'].entries()) {
+    const messageId = `report-${String(index)}` as unknown as MessageId
+    owner.pending.push(messageId)
+    reports.record(messageId, text)
+  }
+}
+
+test('取消结算时作废仍未投递的 report', async () => {
+  const host = fakeHost()
+  const control = controllableRun()
+  const programs = createProgramJobs(host.ctx, control.run)
+  const owner = inboxOwner('owner-a')
+
+  programs.start(request(owner.owner, 'return 1'))
+  deliverReports(control, owner)
+  assert.equal(owner.pending.length, 2)
+
+  const cancelled = programs.cancel(owner.owner)
+  control.pending[0]?.({ output: '程序执行失败（abort）：cancelled', status: 'failed' })
+  await cancelled
+
+  // design.md §4.4：程序死了，它没来得及说的话就别说了。取消返回的那一刻队列里就该空了。
+  assert.deepEqual(owner.pending, [], '取消返回之后，仍未投递的 report 必须已经被摘掉')
+  // 摘掉的条数随 `flow/end` 发出去：观察面靠它把"报出去了"和"真的被读到了"对齐。
+  const submission = host.submissions[0]
+  assert.ok(submission !== undefined)
+  await submission.hooks.done
+  assert.deepEqual(host.events.filter(event => event.name === 'flow/end').map(event => event.args[0]), [
+    { runId: submission.id, status: 'killed', discarded: 2, detail: 'cancelled by the initiating agent' },
+  ])
+})
+
+test('作废本身抛（收件箱投影已注销）时收住：flow/end 照发，只记一条警告', async () => {
+  const host = fakeHost()
+  const control = controllableRun()
+  const programs = createProgramJobs(host.ctx, control.run)
+  // owner 已被 dispose 的那一侧：收件箱投影随会话注销，`Inbox.remove` 不是返回 `false` 而是**抛**
+  // （packages/core/agent-loop/src/inbox.ts:189-197 的 `current()` 显式 throw）。取消入口之一就是
+  // owner disposal（design.md §4.4），所以这条路径真实存在。
+  const owner = {
+    id: 'owner-a' as unknown as SessionId,
+    inbox: {
+      remove(): boolean {
+        throw new Error('agent "owner-a" cannot read inbox state: its projection registration is not active')
+      },
+    },
+  } as unknown as Agent
+
+  programs.start(request(owner, 'return 1'))
+  const reports = control.requests[0]?.reports
+  assert.ok(reports !== undefined, 'the producer must hand the run its report ledger')
+  reports.record('report-0' as unknown as MessageId, 'one')
+
+  const cancelled = programs.cancel(owner)
+  control.pending[0]?.({ output: 'cancelled', status: 'failed' })
+  await cancelled
+  const submission = host.submissions[0]
+  assert.ok(submission !== undefined)
+  // 结算回调是没有接收者的 `.then` 链：它抛出去就是一个 unhandled rejection，而且跳掉 `flow/end`。
+  await submission.hooks.done
+  await tick()
+
+  assert.equal(host.warnings.length, 1, '摘失败必须只记一条警告')
+  assert.match(host.warnings[0] ?? '', /discarding undelivered reports failed/)
+  assert.match(host.warnings[0] ?? '', /projection registration is not active/)
+  // start↔end 成对：摘失败不影响这一对里的后半截。
+  assert.deepEqual(host.events.filter(event => event.name === 'flow/end').map(event => event.args[0]), [
+    { runId: submission.id, status: 'killed', discarded: 0, detail: 'cancelled by the initiating agent' },
+  ])
+})
+
+test('正常结算不作废仍未投递的 report', async () => {
+  const host = fakeHost()
+  const control = controllableRun()
+  const programs = createProgramJobs(host.ctx, control.run)
+  const owner = inboxOwner('owner-a')
+
+  programs.start(request(owner.owner, 'return 1'))
+  deliverReports(control, owner)
+
+  control.pending[0]?.({ output: 'done', status: 'completed' })
+  const submission = host.submissions[0]
+  assert.ok(submission !== undefined)
+  await submission.hooks.done
+
+  // `followup` 只是把消息放进 `next-turn` 挂起队列（phase4-plan §10 Q1）：跑完不是取消，
+  // 一条还没被读到的正常汇报不作废。
+  assert.deepEqual(owner.pending, ['report-0', 'report-1'])
+})
+
+test('flow/* 事件：启动、report、结束都以 run 身份关联', async () => {
+  const host = fakeHost()
+  const control = controllableRun()
+  const programs = createProgramJobs(host.ctx, control.run)
+  const owner = inboxOwner('owner-a')
+
+  const id = programs.start(request(owner.owner, 'return 1'))
+  assert.deepEqual(host.events.map(event => event.name), ['flow/start'])
+  assert.deepEqual(host.events[0]?.args, [{ runId: id, label: 'return 1', ownerSession: 'owner-a' }])
+
+  deliverReports(control, owner)
+  assert.deepEqual(
+    host.events.filter(event => event.name === 'flow/report').map(event => event.args[0]),
+    [{ runId: id, text: 'one' }, { runId: id, text: 'two' }],
+  )
+
+  control.pending[0]?.({ output: 'done', status: 'completed', detail: 'exit code: 3' })
+  const submission = host.submissions[0]
+  assert.ok(submission !== undefined)
+  await submission.hooks.done
+
+  assert.deepEqual(host.events.filter(event => event.name === 'flow/end').map(event => event.args[0]), [
+    // 没被取消，所以一条也没作废——`discarded` 在非取消路径上是 `0`。
+    { runId: id, status: 'completed', discarded: 0, detail: 'exit code: 3' },
+  ])
+})
+
+test('flow/* 是 observe-only：监听者抛异常只记一条警告，不影响 job', async () => {
+  const host = fakeHost('flow/start')
+  const control = controllableRun()
+  const programs = createProgramJobs(host.ctx, control.run)
+  const owner = agent('owner-a')
+
+  // 启动路径上抛出去会把一次成功的提交报成失败，所以它必须被收住。
+  const id = programs.start(request(owner, 'return 1'))
+  assert.equal(String(id), 'execution-engine-1')
+  assert.equal(host.warnings.length, 1)
+  assert.match(host.warnings[0] ?? '', /flow\/\* listener threw/)
+  assert.match(host.warnings[0] ?? '', /listener for flow\/start threw/)
 })

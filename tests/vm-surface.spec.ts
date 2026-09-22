@@ -238,6 +238,49 @@ return { ok, failure, syncThrow }
   }
 })
 
+/**
+ * `report` 是阶段 4 加进来的单向汇报通道：外壳把 `text` 包成绑定参数转发出去，绑定拒绝时程序看到
+ * 拒绝，而**投递结果不回程序**（design.md §6.3：等投递成功，不等主 agent 处理完）。真实的投递与
+ * 作废由 loader 驱动（B11/B12）覆盖；这里钉住的是"程序能调到它、参数过外壳、结果是 void"。
+ */
+test('report 经外壳转发，且不把结果交回程序', async () => {
+  const { root, tmpDir } = await makeRoots()
+  const calls: unknown[] = []
+  const namespace = Object.create(null) as Record<string, unknown>
+  Object.defineProperty(namespace, 'report', {
+    enumerable: true,
+    value: (args: unknown): Promise<null> => {
+      calls.push(args)
+      const text = (args as { text: string }).text
+      return text === 'boom' ? Promise.reject(new Error('the run was cancelled')) : Promise.resolve(null)
+    },
+  })
+  try {
+    const value = await runGuest({
+      tmpDir,
+      cwd: root,
+      flow: namespace,
+      program: `
+const returned = await report('one')
+let failure = 'none'
+try { await report('boom') } catch (error) { failure = String(error && error.message) }
+// 接口声明写的是 Promise：参数不合法也要走拒绝，而不是同步抛出。
+let syncThrow = 'none'
+try { report(42).catch(() => {}) } catch (error) { syncThrow = 'threw' }
+return { returnedIsUndefined: returned === undefined, failure, syncThrow }
+`,
+    })
+    assert.deepEqual(asJson(value), {
+      returnedIsUndefined: true,
+      failure: 'the run was cancelled',
+      syncThrow: 'none',
+    })
+    assert.deepEqual(calls, [{ text: 'one' }, { text: 'boom' }])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 /** 文件助手限定在 run 临时目录与会话目录内；越界读写被拒，而根内以 `..` 开头的文件名不误判。 */
 test('文件助手限定在 run 临时目录与会话目录内', async () => {
   const { root, tmpDir } = await makeRoots()

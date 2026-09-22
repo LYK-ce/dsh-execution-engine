@@ -31,6 +31,9 @@ export function sdkText(timeouts: ProcessTimeouts): string {
 所以程序要写成一个能自己跑完的整体：不确定的步骤派子 agent，确定的步骤跑外部程序——
 写完之后执行是机械的。
 
+程序唯一的回报通道是它自己调的 \`report\`：每条 report 作为一条独立消息唤醒你，**按程序的调用顺序
+到达**，不会和其他消息挤在一起。报什么、报几次由程序决定——攒到阶段边界再报是你的程序该有的纪律。
+
 \`cancel_program\` 在**清理真正完成之后**才返回：进程、子 agent 与临时目录都已经收干净。
 程序里**没有 \`await\` 的外部程序也算在清理范围内**，所以取消可能要等到它结束——
 这段时间受那一次 \`process\` 自己的超时约束。
@@ -58,6 +61,12 @@ declare function process(argv: string[], opts?: ProcessOptions): Promise<Process
 
 /** 同 process，但非零退出码或超时抛出。用于表达"这一步必须成功"。 */
 declare function processOrThrow(argv: string[], opts?: ProcessOptions): Promise<ProcessOutput>
+
+/**
+ * 向发起你的会话单向汇报一段内容。它成为那边独立的一轮，按你调用的顺序到达。
+ * await 只等投递成功，不等它处理完；程序被取消时已经投出去但还没被读到的汇报会作废。
+ */
+declare function report(text: string): Promise<void>
 
 /** 读一个文本文件。路径应当落在 flow.tmpDir 或本次 run 的工作目录内——这是给程序的引导，不是安全边界。 */
 declare function readTextFile(path: string): Promise<string>

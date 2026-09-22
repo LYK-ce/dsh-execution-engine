@@ -32,6 +32,11 @@
  * - B9 取消等清理：给一个 fork 了子进程并 sleep 的程序发取消，**返回的那一刻**两个进程都已消失、
  *   临时目录已删除，3s 后本该出现的哨兵文件始终没有出现；
  * - B10 job owner 生命周期：dispose 发起 agent 的 scope → job 被取消、清理完成、记录被删除。
+ * - B11 `report` 真的投递给发起 agent（顺序、`source`、摘要上界），且 `flow/start` / `flow/report` /
+ *   `flow/end` 三个 observe-only 事件以同一个 run 身份发全；
+ * - B12 取消后未投递的 `report` 不再投递：程序报三条然后去等一个长跑进程，取消返回时那三条已经从
+ *   发起者的挂起队列里消失，而**上一次 run** 留下的两条原封不动（作废的范围是本次 run）；这一次的
+ *   `flow/end` 因此带上 `discarded: 3`，上一次（正常跑完）是 `0`。
  *
  * 受限组合（`tests/fixtures/cordis-confined.yml`，workspace-write）：
  * - B5 `process` 起的外部进程过发起会话的文件策略：同一个程序里，写工作目录外的路径被
@@ -39,7 +44,7 @@
  *
  * 用法（cwd = 仓库根，必须带 tsx，否则裸包名解析不到源码）：
  *   node --import tsx/esm Workspace/ExecutionEngine/tests/loader-driver.ts \
- *     Workspace/ExecutionEngine/tests/fixtures/cordis.yml              # B0–B4、B6–B10
+ *     Workspace/ExecutionEngine/tests/fixtures/cordis.yml              # B0–B4、B6–B12
  *   node --import tsx/esm Workspace/ExecutionEngine/tests/loader-driver.ts \
  *     Workspace/ExecutionEngine/tests/fixtures/cordis-confined.yml     # B0、B5、B8
  *
@@ -54,6 +59,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { boot, resolveConfigPath } from '@deepseek-ai/dsh-app-boot'
 import type { JobId } from '@deepseek-ai/dsh-jobs'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import type { MessageId, UserMessage } from '@deepseek-ai/dsh-llm'
 import { FAILURE_DIAGNOSTIC, FAILURE_MARKER, SCRIPTED_REPLY, scriptedStarts } from './fixtures/scripted-subagent-provider.ts'
 import * as plugin from '../host/index.ts'
 
@@ -153,22 +159,37 @@ function liveRunDirs(): string[] {
  *
  * 注册表 disposal 与 scope disposal 是两件事：前者摘掉注册记录，后者才是"会话关闭"，
  * job 的 drain 挂在后者上（先例 packages/jobs/tool-jobs/tests/tool-jobs.spec.ts:44-71）。
+ *
+ * 阶段 4 起这个替身还带一个**收件箱**：`report` 需要 `followup`，作废需要 `inbox.remove`
+ * （`host/report-binding.ts`）。真身是 agent-loop 的 `ReactLoopInbox`，但本驱动不挂
+ * `dsh-agent-loop`（它要模型 route、会话持久化一整套），所以这里按契约做最小实现：投进来的消息
+ * **一直挂着、不被领取**——那正是"主 agent 正忙、还没走到下一个 turn"的那一段，也是 B12 要的形态。
  * @param label - 会话 id 用的前缀，便于在日志里区分。
- * @returns 发起者与它自己的 scope fiber。
+ * @returns 发起者、它自己的 scope fiber，以及收件箱里挂着的消息（按投递顺序）。
  */
 async function makeAgent(label: string) {
   const scope = ctx.plugin(() => {})
   const session = sessions.create(undefined, { meta: { cwd: policyService.resolve().workspaceRoot } })
+  const pending: UserMessage[] = []
   const agent = {
     id: session.id,
     session,
     options: {},
     status: 'running',
     ctx: scope.ctx,
+    followup(message: UserMessage) { pending.push(message) },
+    inbox: {
+      remove(messageId: MessageId): boolean {
+        const index = pending.findIndex(message => message.id === messageId)
+        if (index < 0) return false
+        pending.splice(index, 1)
+        return true
+      },
+    },
   } as unknown as Agent
   await agents.register(agent)
   assert.equal(agents.get(session.id), agent, `${label}: the owner must be the registered instance`)
-  return { agent, scope }
+  return { agent, scope, pending }
 }
 
 const initiator = (await makeAgent('initiator')).agent
@@ -299,7 +320,7 @@ try {
   const sdk = assembly.sections.find(section => section.name === 'execution-engine-sdk')
   assert.ok(sdk !== undefined, 'the execution-engine-sdk prompt section is not registered')
   assert.equal(sdk.interpolate, false, 'the SDK text must not be interpolated')
-  for (const declaration of ['declare function dispatchsubagent(', 'declare function process(', 'declare function processOrThrow(', 'flow.tmpDir', 'declare const console', 'cancel_program']) {
+  for (const declaration of ['declare function dispatchsubagent(', 'declare function report(', 'declare function process(', 'declare function processOrThrow(', 'flow.tmpDir', 'declare const console', 'cancel_program']) {
     assert.ok(sdk.text.includes(declaration), `the SDK section must declare ${declaration}`)
   }
 
@@ -594,6 +615,148 @@ return 'never'
       'B10: the owner disposal must have removed the job record',
     )
     process.stdout.write('B10 job owner disposal cancels and awaits the program: OK\n')
+
+    // ---- B11：report 真的投递给发起 agent，顺序与程序调用顺序一致 -----------------
+    // ---- B12：取消后未投递的 report 不再投递 -------------------------------------
+    // 两条共用一个单独的发起者：它的收件箱替身不领取任何东西，所以"挂起"就是它的全部状态。
+    const reporter = await makeAgent('reporter')
+
+    /**
+     * `flow/*` 的观察面。驱动从 boot 拿到的根上下文就收得到：Cordis 的 events 服务是根上下文那一个
+     * 实例，子上下文按原型链共用它（`vendor/cordis/src/context.ts:80`），dispatcher 也不做作用域
+     * 过滤（本插件的发射不带 `this`）。监听器不消费任何东西——observe-only 就是"看着"。
+     *
+     * 判据一律**按 run 身份筛**，不按下标：这些事件从别的 promise 链上发出来，别的用例的事件什么
+     * 时候落地不该影响这里的结论。
+     */
+    const flowStart: unknown[] = []
+    const flowReport: unknown[] = []
+    const flowEnd: unknown[] = []
+    ctx.on('flow/start', payload => { flowStart.push(payload) })
+    ctx.on('flow/report', payload => { flowReport.push(payload) })
+    ctx.on('flow/end', payload => { flowEnd.push(payload) })
+
+    /**
+     * 某一次 run 的事件。
+     * @param events - 已经收到的事件。
+     * @param runId - 要挑出来的那次 run。
+     * @returns 属于这次 run 的事件，按到达顺序。
+     */
+    function eventsOf(events: readonly unknown[], runId: string): unknown[] {
+      return events.filter(event => (event as { runId: string }).runId === runId)
+    }
+
+    /**
+     * 一条 report 消息的正文，顺带钉住投递形态（`host/report-binding.ts` 的 source 契约）。
+     * @param message - 发起者收件箱里的一条消息。
+     * @param label - 断言失败时的用例名。
+     * @returns 消息的文本正文。
+     */
+    function reportText(message: UserMessage, label: string): string {
+      const source = message.source
+      if (source.kind !== 'plugin') {
+        throw new Error(`${label}: a report must be plugin-sourced, got ${source.kind}`)
+      }
+      assert.equal(source.plugin, 'execution-engine', `${label}: the report must name this plugin`)
+      assert.equal(source.form, 'notice', `${label}: a report is a notice`)
+      if (source.form !== 'notice') throw new Error(`${label}: unreachable`)
+      // 一行折叠摘要：既不能是空串，也不能把整段 report 塞进去（CONTEXT_SUMMARY_MAX_CHARS = 120）。
+      assert.ok(source.summary.length > 0, `${label}: the summary must not be empty`)
+      assert.ok(
+        source.summary.length <= 120,
+        `${label}: the summary must be bounded, got ${String(source.summary.length)} chars`,
+      )
+      const block = message.content[0]
+      if (block === undefined || block.type !== 'text') throw new Error(`${label}: a report carries one text block`)
+      return block.text
+    }
+
+    /**
+     * 等一个条件成立。
+     *
+     * `flow/end` 是在 job 的 `done` 回调里发的，而 `ctx.jobs.wait` 也在同一个 promise 上——两边的
+     * 微任务顺序不是驱动该去猜的东西。等它真的到了，比"猜它已经到"可靠（与 `waitForFiles` 同一个
+     * 理由，也避免慢机器上的偶发失败）。
+     * @param condition - 要等的条件，每次轮询重新求值。
+     * @param timeoutMs - 等待上界；超了就是判据没跑成，不是判据失败。
+     * @param label - 超时信息里的用例名。
+     */
+    async function waitFor(condition: () => boolean, timeoutMs: number, label: string): Promise<void> {
+      const deadlineAt = Date.now() + timeoutMs
+      while (!condition()) {
+        if (Date.now() > deadlineAt) {
+          throw new Error(`${label}: timed out after ${String(timeoutMs)}ms waiting for its precondition`)
+        }
+        await delay(20)
+      }
+    }
+
+    const b11 = await startProgram(`
+await report('one')
+await report('two')
+return 'B11_DONE'
+`, reporter.agent)
+    const b11Output = await jobOutput(b11.jobId, reporter.agent)
+    assertProgramSucceeded(b11Output, 'B11')
+    assert.equal(returned(b11Output), 'B11_DONE')
+    await waitFor(() => eventsOf(flowEnd, b11.jobId).length >= 1, 20_000, 'B11')
+
+    // 判据 1：两条 report 都进了发起者的收件箱，顺序**就是**程序调用的顺序（design.md §6.2）。
+    assert.deepEqual(
+      reporter.pending.map(message => reportText(message, 'B11')),
+      ['one', 'two'],
+      'every report must reach the initiating agent, in call order',
+    )
+    const b11PendingIds = reporter.pending.map(message => message.id)
+
+    // 判据 2：三个 observe-only 事件都发全了，而且带的是同一个 run 身份。
+    assert.deepEqual(eventsOf(flowStart, b11.jobId), [
+      { runId: b11.jobId, label: "await report('one')", ownerSession: reporter.agent.id },
+    ])
+    assert.deepEqual(eventsOf(flowReport, b11.jobId), [
+      { runId: b11.jobId, text: 'one' },
+      { runId: b11.jobId, text: 'two' },
+    ])
+    assert.deepEqual(eventsOf(flowEnd, b11.jobId), [{ runId: b11.jobId, status: 'completed', discarded: 0 }])
+    process.stdout.write('B11 report delivery, order, source and flow/* events: OK\n')
+
+    // B12：程序报三条，然后去等一个长跑进程——三条都还挂在队列里（这一侧的收件箱不领取）。
+    const b12 = await startProgram(`
+await report('one')
+await report('two')
+await report('three')
+await process(['python', '-c', 'import time; time.sleep(60)'])
+return 'B12_DONE'
+`, reporter.agent)
+    assert.equal(b12.status, 'running')
+    await waitFor(() => reporter.pending.length >= b11PendingIds.length + 3, 20_000, 'B12')
+    assert.deepEqual(
+      reporter.pending.slice(b11PendingIds.length).map(message => reportText(message, 'B12')),
+      ['one', 'two', 'three'],
+    )
+
+    const b12Cancel = await callCancelProgram(reporter.agent)
+    assert.equal(b12Cancel.isError, false, `cancelling the B12 program failed: ${textOf(b12Cancel)}`)
+    const b12CancelValue = b12Cancel.value as { cancelled: boolean; status?: string }
+    assert.equal(b12CancelValue.cancelled, true)
+    assert.equal(b12CancelValue.status, 'killed')
+
+    // 判据：取消返回的那一刻，本次 run 还没被读到的三条已经不在队列里；上一次 run（正常跑完）
+    // 留下的两条原封不动——作废的范围是**被取消的那一次 run**，不是这个发起者的整个收件箱。
+    assert.deepEqual(
+      reporter.pending.map(message => message.id),
+      b11PendingIds,
+      'a cancelled run must discard its own undelivered reports and nothing else',
+    )
+    await waitFor(() => eventsOf(flowEnd, b12.jobId).length >= 1, 20_000, 'B12')
+    // 三条都投递成功了、一条都没被领取，所以这次取消把三条全摘了——条数随 `flow/end` 报出来。
+    assert.deepEqual(eventsOf(flowEnd, b12.jobId), [{
+      runId: b12.jobId,
+      status: 'killed',
+      discarded: 3,
+      detail: 'cancelled by the initiating agent',
+    }])
+    process.stdout.write('B12 undelivered reports are discarded on cancel: OK\n')
   } else {
     // ---- B5：受限组合——工作目录外的写被策略拒绝，工作目录内的写成功 -----------
     // 两条用例在同一个程序、同一个 `process` 绑定、同一份策略下跑同一段 python 脚本，

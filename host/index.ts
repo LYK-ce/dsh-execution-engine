@@ -2,8 +2,8 @@
  * ExecutionEngine 的 host 半边：把 `run_program` 变成后台 job，加上 `cancel_program`，
  * 挂上 job controller，并注册它的 `.d.ts` 系统提示段。
  *
- * 阶段 3 的边界：有后台 job、有单例、有取消（design.md §4.1–§4.4）。
- * 仍然没有 `report`、没有 `flow/*` 事件、没有 UI——主 agent 的程序结果在阶段 4 才有模型可见路径。
+ * 阶段 4 的边界：有 `report`（程序单向汇报回发起会话）、有 `flow/*` observe-only 事件。
+ * 仍然没有 UI——`flow/*` 的消费者在阶段 6。
  * @module dsh-execution-engine
  */
 

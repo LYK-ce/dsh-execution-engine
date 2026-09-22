@@ -1,7 +1,8 @@
 /**
- * `run_program` 的后台 job 半边：提交、单例、取消（design.md §4.1–§4.4；phase3-plan §2–§4）。
+ * `run_program` 的后台 job 半边：提交、单例、取消、`report` 记账与 `flow/*` 事件
+ * （design.md §4.1–§4.4、§8.1；phase3-plan §2–§4、phase4-plan §3–§4）。
  *
- * 三条契约：
+ * 四条契约：
  *
  * - **提交即返回**：`ctx.jobs.start` 同步调用 `run()` 并要它同步交回 hooks，所以这里只把
  *   `execute(...)` 这个 pending promise 接过来，绝不 `await`（phase3-plan R3）。
@@ -11,6 +12,10 @@
  * - **取消等清理**：`cancel` 同步且幂等；`cancel()` 在 `await` 到 job 的 `done` 之后才返回，而
  *   `done` 在 `runProgram` 的 `finally`（删临时目录）与在飞外部执行静默之后才 resolve
  *   （design.md §4.4；逐跳位置见 `host/engine.ts` 的 `runProgram`）。
+ * - **取消作废未投递的 report**：结算时若终态是 `killed`，把还挂在发起者队列里的 report 摘掉
+ *   （design.md §4.4）。四条取消入口（工具、注册表、owner disposal、插件卸载）都收敛到 producer 的
+ *   `hooks.cancel`，所以判据挂在**终态**上而不是挂在 `cancel()` 上。摘的动作自己也收住异常：owner
+ *   已被 dispose 时收件箱投影已经注销，摘会抛而不是返回 `false`（见 `discardPending`）。
  *
  * 本模块**不引入任何运行时依赖**：跨包一律 `import type`，`runProgram` 由装配方注入，所以纯 Node
  * 的 `pnpm run test` 能直接加载它（phase1-plan §10 A 档）。
@@ -22,8 +27,12 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { JobHooks, JobId, JobOutcome } from '@deepseek-ai/dsh-jobs'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { RunProgramOutcome, RunProgramRequest } from './engine.ts'
-// 仅类型：`JobKindMap` 的合并入口，本模块的 `kind: 'execution-engine'` 靠它才成立。
+// 仅类型：`JobKindMap` 与 `Events`（`flow/*`）两个合并入口，本模块的 `kind` 与 `ctx.emit` 靠它们
+// 才成立。
 import type {} from './jobs-types.ts'
+import type {} from './flow-events.ts'
+import { createReportLedger } from './report-binding.ts'
+import type { ReportLedger } from './report-binding.ts'
 
 /** job 标签的上限；标签是一行摘要（`JobStart.label`），太长会污染状态行。 */
 const LABEL_MAX_LENGTH = 80
@@ -32,13 +41,14 @@ const LABEL_MAX_LENGTH = 80
 const CANCEL_REASON = 'cancelled by the initiating agent'
 
 /**
- * 一次 `run_program` 的提交请求：`RunProgramRequest` 去掉 `signal`。
+ * 一次 `run_program` 的提交请求：`RunProgramRequest` 去掉 `signal` 与 `reports`。
  *
- * 这个 `Omit` 是设计的一部分，不是省事：主 agent 取消**一轮 turn**（`ToolRunContext.signal`）
+ * 这两个 `Omit` 是设计的一部分，不是省事：主 agent 取消**一轮 turn**（`ToolRunContext.signal`）
  * 不该杀掉后台程序——"绑的是 agent 实例的生命周期，不是 turn"（design.md §5.3）。所以程序的
- * 取消信号只有一个来源，就是提交时为它新建的那个 controller。
+ * 取消信号只有一个来源，就是提交时为它新建的那个 controller。`reports` 同理：记账的范围是一次
+ * job，只有持有单例槽位的这里造得出来。
  */
-export type ProgramRequest = Omit<RunProgramRequest, 'signal'>
+export type ProgramRequest = Omit<RunProgramRequest, 'signal' | 'reports'>
 
 /**
  * `runProgram` 的入口。由装配方注入而不是直接 import：`host/engine.ts` 在运行时拉进
@@ -91,7 +101,8 @@ interface LiveProgram {
  * 记账的作用域是**每个发起 agent 一个**，不是全局一个（design.md §4.2）：不同会话各跑各的。
  * 登记在 `live` 里的条目在 `done` 结算之后才删——若在 `cancel()` 之后就删，"取消返回后立刻
  * 启动新的"会撞上一个还在清理的旧 job（phase3-plan §3）。
- * @param ctx - 宿主上下文；`ctx.jobs` 是注册表，`ctx.effect` 负责插件 dispose 时清空记账。
+ * @param ctx - 宿主上下文；`ctx.jobs` 是注册表，`ctx.emit` 发 `flow/*` 观察事件，
+ *   `ctx.effect` 负责插件 dispose 时清空记账。
  * @param execute - 真正的执行入口（装配方传 `runProgram`）。
  * @returns 提交与取消两个操作。
  */
@@ -121,12 +132,28 @@ export function createProgramJobs(ctx: Context, execute: ProgramExecute): Progra
       const running = live.get(owner.id)
       if (running !== undefined) throw new Error(alreadyRunning(running.jobId))
 
+      // 本次 run 的 report 记账与 `flow/*` 发射点。run 身份（job id）要等 `ctx.jobs.start` 返回才有，
+      // 所以这里先声明、拿到 id 之后立刻填；第一次投递最早也只能发生在那一刻之后——`runProgram`
+      // 先 await 建临时目录，再把绑定交给 PTC。填不上就是这段时序被改坏了，直接抛。
+      let runId: JobId | undefined
+      const reports = createReportLedger({
+        onDelivered: ({ text }) => {
+          // 窄化在闭包里不保留，所以先取出来后按这个常量发射。
+          const identity = runId
+          if (identity === undefined) {
+            throw new Error('execution-engine: a report was delivered before this run had a job id')
+          }
+          emitFlow(ctx, () => { ctx.emit('flow/report', { runId: identity, text }) })
+        },
+      })
+      const label = programLabel(request.code)
+
       // `run()` 在 `ctx.jobs.start` 返回 id 之前被同步调用，此时还没有 id 可记，所以 hooks
       // 先落在槽位里，`start` 返回后再连同 id 一起记账。
       const slot: { hooks: JobHooks | null } = { hooks: null }
       const jobId = ctx.jobs.start({
         kind: 'execution-engine',
-        label: programLabel(request.code),
+        label,
         owner,
         run: () => {
           // 取消的唯一来源。它可以早于 `runProgram` 建临时目录：abort 之后再跑的那一段，
@@ -134,12 +161,13 @@ export function createProgramJobs(ctx: Context, execute: ProgramExecute): Progra
           const controller = new AbortController()
           const hooks: JobHooks = {
             cancel: (reason) => { controller.abort(reason) },
-            done: toJobOutcome(execute({ ...request, signal: controller.signal }), controller),
+            done: toJobOutcome(execute({ ...request, signal: controller.signal, reports }), controller),
           }
           slot.hooks = hooks
           return hooks
         },
       })
+      runId = jobId
 
       const hooks = slot.hooks
       /* v8 ignore next -- 注册表契约：`run()` 在 `start` 返回之前必然被调用一次。 */
@@ -148,8 +176,31 @@ export function createProgramJobs(ctx: Context, execute: ProgramExecute): Progra
       live.set(owner.id, submitted)
       // 清理挂在 `done` 上，不挂在 `cancel()` 上：`done` 是"资源已经释放"的证明，
       // 而 `cancel()` 只表示"已经请求终止"（phase3-plan §3 的 R7 也由这一条覆盖）。
-      void hooks.done.then(() => {
+      void hooks.done.then((outcome) => {
         if (live.get(owner.id) === submitted) live.delete(owner.id)
+        // 取消作废，正常结算不作废。判据是**终态**：`toJobOutcome` 只在 controller 被 abort 过时
+        // 给 `killed`，而四条取消入口（`cancel_program`、注册表、owner disposal、插件卸载）都会走
+        // 到 producer 的 `hooks.cancel`，所以这一条覆盖了它们全部。
+        //
+        // 正常结算不作废，是因为 `followup` 只是把消息放进 `next-turn` 挂起队列
+        // （`packages/core/agent-loop/src/agent.ts:137-139`），主 agent 还没领取——那是一条还没说
+        // 出口的正常汇报，不是幽灵报告。作废它会把"最后一条 report 刚投出去、程序立刻结束"这种
+        // 时序下的末条汇报吃掉（phase4-plan §10 Q1）。
+        //
+        // 摘的条数进 `flow/end`：观察面要能把"报出去了"（`flow/report`）和"真的被读到了"对齐，
+        // 只发前者的话，阶段 6 的面板重建不出哪些 report 被这次取消吃掉了。
+        const discarded = outcome.status === 'killed' ? discardPending(ctx, reports, owner) : 0
+        emitFlow(ctx, () => {
+          ctx.emit('flow/end', {
+            runId: jobId,
+            status: outcome.status,
+            discarded,
+            ...outcome.detail === undefined ? {} : { detail: outcome.detail },
+          })
+        })
+      })
+      emitFlow(ctx, () => {
+        ctx.emit('flow/start', { runId: jobId, label, ownerSession: owner.id })
       })
       return jobId
     },
@@ -169,6 +220,47 @@ export function createProgramJobs(ctx: Context, execute: ProgramExecute): Progra
         ...outcome.detail === undefined ? {} : { detail: outcome.detail },
       }
     },
+  }
+}
+
+/**
+ * 发一个 `flow/*` 观察事件。
+ *
+ * observe-only 的契约是单向的：监听者坏了不能反过来影响 job。`flow/end` 是在 job 结算回调里发的，
+ * 那里抛出去就是一个没人接收的 rejection；`flow/start` 在 `run_program` 的返回路径上，那里抛出去
+ * 会把一次成功的提交报成失败。所以监听者的异常在这里收住，只记一条警告
+ * （先例 `packages/workflow/workflow/src/index.ts:175-186` 的 `emitWorkflowEvent`）。
+ * @param ctx - 宿主上下文；事件与告警都从这里出。
+ * @param emit - 真正的那一次 emit。
+ */
+function emitFlow(ctx: Context, emit: () => void): void {
+  try {
+    emit()
+  } catch (error: unknown) {
+    ctx.logger.warn(`execution-engine: a flow/* listener threw: ${renderThrown(error)}`)
+  }
+}
+
+/**
+ * 摘掉本次 run 还挂在发起者队列里的 report，并收住异常。
+ *
+ * 收住是必须的：`owner.inbox.remove` 在收件箱投影已经注销时**抛**而不是返回 `false`
+ * （`packages/core/agent-loop/src/inbox.ts:189-197` 的 `current()` 显式 throw），而 owner disposal
+ * 正是取消入口之一（design.md §4.4）——取消到一个已经被 dispose 的会话上，这一步就会抛。这个调用
+ * 在 job 结算回调里，抛出去有两个后果：同一段里的 `flow/end` 发不出去（破坏 start↔end 成对），
+ * 以及这条 `.then` 链变成一个没人接收的 rejection。所以和 {@link emitFlow} 同形态：只记一条警告。
+ * 投影不存在时一条也摘不掉，所以回落的计数是 `0`。
+ * @param ctx - 宿主上下文；告警从这里出。
+ * @param reports - 本次 run 的 report 记账。
+ * @param owner - 发起本次 run 的主 agent。
+ * @returns 真的被摘掉的条数；摘的动作失败时是 `0`。
+ */
+function discardPending(ctx: Context, reports: ReportLedger, owner: Agent): number {
+  try {
+    return reports.discardPending(owner)
+  } catch (error: unknown) {
+    ctx.logger.warn(`execution-engine: discarding undelivered reports failed: ${renderThrown(error)}`)
+    return 0
   }
 }
 

@@ -404,8 +404,11 @@ declare function process(argv: string[], opts?: ProcessOptions): Promise<Process
 /** 同 process，但非零退出码或超时抛出。 */
 declare function processOrThrow(argv: string[], opts?: ProcessOptions): Promise<ProcessOutput>
 
-/** 向主 agent 单向汇报一段内容。主 agent 会被唤醒阅读。 */
-declare function report(text: string): void
+/**
+ * 向主 agent 单向汇报一段内容。主 agent 会被唤醒阅读。
+ * await 只等投递成功，不等主 agent 处理完（§6.3）：这一行返回时，汇报已经在主 agent 的挂起队列里。
+ */
+declare function report(text: string): Promise<void>
 
 interface ProcessOptions {
   /** 本次执行的超时（毫秒）。默认 300000，上限 900000。 */
@@ -503,7 +506,7 @@ interface ProcessOutput {
 
 - `report` binding → 主 agent 收件箱的 `followup`，每条一次模型调用（§6.1）
 - **未投递的 `report` 在取消时作废**（§4.4）
-- `flow/*` observe-only 事件：启动、程序源码、原语调用起止、`report`、结束（§8.1）
+- `flow/*` observe-only 事件：**本阶段发三类**——`flow/start`、`flow/report`、`flow/end`（§8.1 列了五类，另两类的去向见阶段 5）
 - 扩展 `.d.ts`
 
 **验证**
@@ -518,7 +521,9 @@ interface ProcessOutput {
 
 - **先确认 guest 里程序如何被求值**（`vm` / `new Function` / 临时文件），据此确定行号映射方案（§8.3）
 - guest 外壳包装各原语，用 `new Error().stack` 取调用点行号并上报；拼接时保持用户源码的行结构不变
-- `flow/*` 事件带上位置
+- `flow/*` 事件带上位置，并补上 §8.1 里推迟的两类：
+  - **程序源码**——它要带行号给面板用，所以形态由本阶段的行号映射决定（事件带原文还是带已编号的行）
+  - **原语调用起止**——位置上报就是它的前提
 - 若 stack 方案不可靠，改走 AST 变换作为 plan B（§8.3）
 
 **验证**

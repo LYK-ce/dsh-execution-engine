@@ -1,15 +1,20 @@
 /**
  * 把一段程序交给 `ctx.ptcRuntime` 执行（phase1-plan §2）。
  *
- * 引擎负责四件事：组装程序正文（外壳 + 用户源码）、把 `dispatchsubagent` 与
- * `process` / `processOrThrow` 作为 `flow` 绑定命名空间挂上、**让一次 run 的在飞外部执行在 run
- * 结束前真正静默**（阶段 3）、把 PTC 的结果渲染成模型可读文本。
+ * 引擎负责四件事：组装程序正文（外壳 + 用户源码）、把 `dispatchsubagent`、
+ * `process` / `processOrThrow` 与 `report` 作为 `flow` 绑定命名空间挂上、**让一次 run 的在飞外部
+ * 执行在 run 结束前真正静默**（阶段 3）、把 PTC 的结果渲染成模型可读文本。
  * 程序失败**不是**异常——它是结果里的一个字段（design.md §3.3 的同一条理由）。
+ *
+ * `report` 的投递助手（`createUserMessage` 与 `boundContextSummary`）在这里注入，是因为
+ * `host/report-binding.ts` 要能在纯 Node 的 `pnpm run test` 下加载：本模块只经 tsx 装配，
+ * 而那个模块不是（理由见 `host/config.ts` 的模块头与 `host/report-binding.ts` 的模块头）。
  * @module dsh-execution-engine/engine
  */
 
 import { randomUUID } from 'node:crypto'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { PtcBindingFunction, PtcJsonValue, PtcRunResult, PtcRuntime } from '@deepseek-ai/dsh-ptc-runtime'
 import type { SandboxExecutionPolicy, SandboxProvider } from '@deepseek-ai/dsh-sandbox'
 import type { SubagentRuntime } from '@deepseek-ai/dsh-subagent'
@@ -17,6 +22,8 @@ import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import { guestSource } from './capabilities.ts'
 import type { ProcessTimeouts } from './config.ts'
 import { createProcessBindings } from './process-binding.ts'
+import { createReportBindings } from './report-binding.ts'
+import type { ReportLedger } from './report-binding.ts'
 import { createSubagentBindings } from './subagent-binding.ts'
 import { createRunTmpDir, removeRunTmpDir } from './tmp-dir.ts'
 
@@ -32,6 +39,11 @@ export interface RunProgramRequest {
   readonly sandboxPolicy?: SandboxExecutionPolicy
   /** 本次调用的取消信号；abort 会终止程序与其在飞的子进程。 */
   readonly signal: AbortSignal
+  /**
+   * 本次 run 的 report 记账；由 job-runner 按 job 建，`report` 每次投递都记在它上面，
+   * run 被取消时按它作废还没被领取的那部分（`host/job-runner.ts`）。
+   */
+  readonly reports: ReportLedger
 }
 
 /** `runProgram` 需要的外部服务与部署策略。 */
@@ -75,7 +87,7 @@ export interface RunProgramOutcome {
  * 收尾，**再**删临时目录。反过来的话，取消刚返回就会有一个旧进程还在往一个已经被删掉的目录里写。
  * 取消路径上的逐跳位置见 {@link trackExternalWork} 的说明。
  * @param deps - PTC / subprocess / subagents / sandbox 执行缝与部署的策略。
- * @param request - 程序正文、cwd、发起者、可选的已解析文件策略、取消信号。
+ * @param request - 程序正文、cwd、发起者、可选的已解析文件策略、取消信号、report 记账。
  * @returns 渲染好的模型可见结果与程序自己的结局分类。
  */
 export async function runProgram(deps: RunProgramDeps, request: RunProgramRequest): Promise<RunProgramOutcome> {
@@ -96,6 +108,13 @@ export async function runProgram(deps: RunProgramDeps, request: RunProgramReques
       signal: request.signal,
       subagents: deps.subagents,
       warn: deps.warn,
+    }),
+    ...createReportBindings({
+      owner: request.parent,
+      signal: request.signal,
+      ledger: request.reports,
+      createMessage: createUserMessage,
+      boundSummary: boundContextSummary,
     }),
   })
   try {
