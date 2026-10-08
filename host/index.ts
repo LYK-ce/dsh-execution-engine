@@ -9,11 +9,8 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-// 仅类型：`ctx.get('agents')` 的反向查找（sessionId → 发起 agent）要它的服务声明。
-import type {} from '@deepseek-ai/dsh-agent'
 // 仅类型：面板的两条路由挂在 `ctx.connection.fetch` 上，它的服务声明与路由契约都在这里。
 import type {} from '@deepseek-ai/dsh-client-connection'
-import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxPolicyService } from '@deepseek-ai/dsh-sandbox-policy'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
@@ -37,7 +34,6 @@ import { FlowState } from './flow-state.ts'
 // 仅类型：`ctx.on('flow/*')` 的事件声明由它合并进来。
 import type {} from './flow-events.ts'
 import { createProgramJobs } from './job-runner.ts'
-import type { ProgramCancel } from './job-runner.ts'
 import { handleCancel, handleState } from './routes.ts'
 import { SDK_SECTION_NAME, sdkText } from './sdk.ts'
 import { createCancelProgramTool, createRunProgramTool } from './tool.ts'
@@ -171,7 +167,7 @@ export function apply(ctx: Context, config: Config): void {
       ...authority.sandboxPolicy === undefined ? {} : { sandboxPolicy: authority.sandboxPolicy },
     })
   }))
-  ctx.tools.register(createCancelProgramTool(exec => programs.cancel(ownerOf(exec, 'cancel_program'))))
+  ctx.tools.register(createCancelProgramTool(exec => programs.cancel(ownerOf(exec, 'cancel_program').id)))
 
   // 面板的观察面：`flow/*` 的宿主侧累加器 + 两条 exact Fetch route（phase6-plan §2）。
   //
@@ -184,15 +180,9 @@ export function apply(ctx: Context, config: Config): void {
   ctx.on('flow/report', info => { flow.report(info) })
   ctx.on('flow/end', info => { flow.end(info) })
 
-  // `sessionId` → 发起 agent 的反向查找只有 agents 注册表能做，所以它**不在** `inject` 里、
-  // 走 `ctx.get` 读（先例同文件上的 `sandboxPolicy`）：`run_program` 的 owner 由工具调用现场给，
-  // 引擎本身不需要这个注册表。它缺席时"没有在跑的程序"就是事实本身——那正是 `cancel_program`
-  // 的幂等语义（design.md §4.4），不编一个错误出来。
-  const cancelBySession = async (sessionId: SessionId): Promise<ProgramCancel> => {
-    const owner = ctx.get('agents')?.get(sessionId)
-    if (owner === undefined) return { cancelled: false }
-    return await programs.cancel(owner)
-  }
+  // 取消不再需要"sessionId → 活着的 agent"的反查：槽位本来就按会话 id 记账，而那条反查会在
+  // owner 刚被 dispose、程序仍在清理的窗口里把"有程序在收尾"错报成"没有程序在跑"。
+  // 于是 `ctx.get('agents')` 这条可选依赖整个消失，headless 部署与工具取消走同一条路径。
 
   // 传输在场时才注册路由。引擎本体不依赖 HTTP，所以 `connection` 走可选注入而不是 `inject`
   // （理由见上面 `inject` 的 JSDoc）；这里的两条路由与 `flow/*` 的累加器都不会因为传输缺席而
@@ -208,7 +198,7 @@ export function apply(ctx: Context, config: Config): void {
       path: CANCEL_PATH,
       methods: ['POST'],
       requestBody: 'buffered',
-      fetch: request => handleCancel(cancelBySession, request),
+      fetch: request => handleCancel(programs.cancel, request),
     }), 'execution-engine: cancel route')
   })
 

@@ -8,7 +8,7 @@ import { PREVIEW_MAX_CHARS } from '../host/guest-source.ts'
 
 /**
  * PTC 引导用的同一个 async 函数构造器；外壳正文就是它的 body，形参名必须与
- * PTC 的绑定命名空间（`flow`）和它注入的 `console` 一致。
+ * PTC 的绑定命名空间（`flow`）一致；PTC 另外注入的 `console` 不进程序可见面。
  */
 const AsyncFunction = (async () => {}).constructor as new (...args: string[]) => (...fnArgs: unknown[]) => Promise<unknown>
 
@@ -99,6 +99,8 @@ async function runGuest(options: {
   logs?: string[]
 }): Promise<unknown> {
   const logs = options.logs ?? []
+  // PTC 仍旧把 `console` 作为形参注入程序正文，所以这里照旧传一个替身；但本插件的 vm 能力面
+  // **不把它挂到全局**（阶段 9 起程序侧没有 console），所以这个 shim 一次都不会被调用。
   const consoleShim = {
     log: (...args: unknown[]) => { logs.push(args.map(String).join(' ')) },
     info: (...args: unknown[]) => { logs.push(args.map(String).join(' ')) },
@@ -149,7 +151,6 @@ test('外壳注入原语，Node 全局仍不可达', async () => {
       flow: flow.namespace,
       logs,
       program: `
-console.log('hello', 1)
 const r = await process(['python', '-c', 'print("x")'], { timeoutMs: 1500 })
 const t = await processOrThrow(['python', '-c', 'pass'])
 return {
@@ -166,7 +167,7 @@ return {
   dynamicImport: await import('node:child_process').then(() => 'reachable', (error) => error.constructor.name),
   jsonUsable: typeof JSON.parse('{"ok":true}') === 'object',
   mathUsable: Math.max(1, 2),
-  consoleIsShim: typeof console.log,
+  consoleType: typeof console,
 }
 `,
     }) as Record<string, unknown>
@@ -175,7 +176,7 @@ return {
       { argv: ['python', '-c', 'print("x")'], timeoutMs: 1_500 },
       { argv: ['python', '-c', 'pass'] },
     ])
-    assert.deepEqual(logs, ['hello 1'])
+    assert.deepEqual(logs, [], 'the program has no console: nothing can reach the run logs')
     assert.deepEqual(asJson(value), {
       code: 3,
       stdout: 'out',
@@ -190,7 +191,7 @@ return {
       dynamicImport: 'TypeError',
       jsonUsable: true,
       mathUsable: 2,
-      consoleIsShim: 'function',
+      consoleType: 'undefined',
     })
   } finally {
     await rm(root, { recursive: true, force: true })
@@ -538,7 +539,7 @@ test('包装层上报调用点行号，行号等于用户源码行号', async ()
 
 /**
  * 阶段 5 的隔离面：`trace` 是外壳与宿主之间的内部通道，**程序看不见它**。
- * 程序看得见的仍然只有四个原语 + `flow.tmpDir` + 文件助手 + `console` + `fetch`。
+ * 程序看得见的仍然只有四个原语 + `flow.tmpDir` + 文件助手 + `fetch`。
  */
 test('trace 不在程序可见面上', async () => {
   const { root, tmpDir } = await makeRoots()
@@ -550,7 +551,7 @@ test('trace 不在程序可见面上', async () => {
       flow: flowNamespace(trace.namespace, stubFlow({ code: 0, stdout: '', stderr: '', timedOut: false }).namespace),
       program: `
 const injected = [
-  'console', 'dispatchsubagent', 'exists', 'fetch', 'flow',
+  'dispatchsubagent', 'exists', 'fetch', 'flow',
   'process', 'processOrThrow', 'readTextFile', 'report', 'writeTextFile',
 ]
 return {

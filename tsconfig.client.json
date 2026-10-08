@@ -23,8 +23,15 @@
     // 与 Blackboard 同一份引用表：这些包的类型产物就是客户端半边的编译环境（它们的源码要
     // CSS Modules 环境，本目录不打包 CSS）。列表照 client/index.tsx 与 client/panel.tsx 真正
     // 用到的声明来：`ctx.locale`、`conversation.view` 的 SlotMap 行、会话作用域标准位、四个份额。
-    { "path": "../../packages/client/locale" },
-    { "path": "../../packages/client/ui-conversation" },
+    //
+    // 分面的包（同一个包有 host 与 client 两个 program）**必须引它的 client 叶子**，不能引包目录：
+    // 包目录下是 solution-only 的根（`files: []` + 两条 leaf 引用），引用它必然 TS6306
+    // （Referenced project must have setting "composite": true），而 0.2.1 起
+    // tsc 会因此整个 program 都不检查——"面板编译不过"会伪装成"没有诊断"。
+    // ui-renderer / ui-session / ui-slots 是普通两入口 Client 插件、不拆面，它们的 tsconfig.json
+    // 本身就是 composite 叶子，所以照旧引目录。
+    { "path": "../../packages/client/locale/tsconfig.client.json" },
+    { "path": "../../packages/client/ui-conversation/tsconfig.client.json" },
     { "path": "../../packages/client/ui-renderer" },
     { "path": "../../packages/client/ui-session" },
     { "path": "../../packages/client/ui-slots" }

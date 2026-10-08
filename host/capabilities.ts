@@ -53,8 +53,8 @@ export function stripUserProgram(program: string): string {
 /**
  * 把固定外壳、run 常量与用户程序拼成交给 `ctx.ptcRuntime` 的程序正文。
  *
- * 正文末尾引用两个参数名：PTC 绑定命名空间 `flow`（见 `engine.ts` 的 `bindings`）与 PTC
- * 注入的 `console`。两者都由 PTC 的 async 函数构造器作为形参提供。
+ * 正文末尾引用 PTC 绑定命名空间 `flow`（见 `engine.ts` 的 `bindings`）。PTC 的 async 函数构造器
+ * 还注入 `console` 与错误类，但它们**不进程序的能力面**：程序侧没有 console（`host/guest-source.ts`）。
  * @param request - 用户程序与本次 run 的两个常量。
  * @returns 完整的程序正文。
  */

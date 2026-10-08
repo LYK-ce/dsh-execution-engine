@@ -4,7 +4,7 @@
 
 本文档是 ExecutionEngine 插件的设计依据。所有产物先放在 `Workspace/` 下，确认可用后再集成进 DSH 本体。
 
-状态：设计已冻结。实现进度见 §12，阶段 0–7 已全部落地（**尚欠阶段 6 的 GIF**，见 §12 阶段 6 与阶段 7 的补记）；§13 的七项待定已在阶段 7 结清。
+状态：设计已冻结。实现进度见 §12，阶段 0–7 已全部落地（**尚欠阶段 6 的 GIF**，见 §12 阶段 6 与阶段 7 的补记）；§13 的七项待定已在阶段 7 结清。阶段 8（按调用指定子 agent 模型）与阶段 9（适配 DSH 0.2.1、并把程序正文从交付面上去掉）已落地，见 §12。
 
 ## 1. 目标与动机
 
@@ -61,7 +61,7 @@ DSH 里已有两个相邻能力，本插件 ≈ **后台化的、带 `process` �
 
 程序是一段 TypeScript。函数、变量、循环、分支、字符串处理、JSON 解析、`Math`——**全都是语言自带的，都有返回值**。
 
-程序体在 `vm` context 里求值（§7.2），因此**它只能看见被显式注入的能力**：`flow` 命名空间、`console`、收窄的文件助手、`fetch`。没有 `import`——**程序不能 import 库或项目文件**，这是选择"能力面可枚举"付出的代价，属于明确接受的取舍。
+程序体在 `vm` context 里求值（§7.2），因此**它只能看见被显式注入的能力**：`flow` 命名空间、收窄的文件助手、`fetch`。没有 `import`——**程序不能 import 库或项目文件**，这是选择"能力面可枚举"付出的代价，属于明确接受的取舍。
 
 **这一条直接决定了"返回值"问题的答案：要一个值，就在程序里用 TS 算；`process` 那个位置本来就不该指望返回值。**
 
@@ -77,8 +77,8 @@ process(argv: string[], opts?: ProcessOptions): Promise<ProcessResult>
 /** 同 process，但非零退出码或超时抛出。用于表达"这一步必须成功"。 */
 processOrThrow(argv: string[], opts?: ProcessOptions): Promise<ProcessOutput>
 
-/** 向主 agent 单向汇报一段内容。 */
-report(text: string): void
+/** 向主 agent 单向汇报一段内容。await 只等投递成功（§6.3），不等它处理完。 */
+report(text: string): Promise<void>
 ```
 
 `dispatchsubagent` 的第二个参数是阶段 8 加的：程序可以按**这一次调用**指定子 agent 用哪个模型。`provider` 与 `model` 必须成对给出（只给一个就抛，不回落），授权来源是部署挂的 `subagent-model-selection` 策略——引擎读**同一份**清单，不新造第二份白名单，也不查 LLM 目录（那是 advisory）。两个都不给就是沿用当前会话的模型，与阶段 2 的语义一致。发现走主 agent 的 `list_subagent_models` 工具，`.d.ts` 不抄目录（§12 阶段 8）。
@@ -246,7 +246,7 @@ DSH 的投递接口有四种形态，本设计选 followup 而非 inject：
 
 这是一个干净的"控制面 / 数据面"划分：程序通过 `report` 单向汇报，主 agent 通过"启动 / 取消"单向控制。**没有任何双向调用，所以结构上不可能死锁。**
 
-**但这三条在默认部署里守不住，如实记账：** 标准 preset 挂着 `@deepseek-ai/dsh-tool-jobs`（`packages/preset/agent-presets/presets/standard/agent.cordis.yml:74-75`），它① 向 owner 投递 job 完成通知，② 把 `job_output` / `job_list` / `job_kill` 三个通用工具暴露给模型。所以主 agent 实际还能**读走程序全文**、还能**杀掉 job**。`JobStart` 没有让生产者退出通知的开关，`reported` 归注册表所有，**本插件从生产方一侧抑制不了**。
+**但这三条在默认部署里守不住，如实记账：** 标准 preset 挂着 `@deepseek-ai/dsh-tool-jobs`（`packages/preset/agent-presets/presets/standard/agent.cordis.yml:74-75`），它① 向 owner 投递 job 完成通知，② 把 `job_output` / `job_list` / `job_kill` 三个通用工具暴露给模型。所以主 agent 还能**看到 job 的存在与终态**、还能**杀掉 job**。其中"**读走程序正文**"这一半已由生产方守住（阶段 9：`JobOutcome` 不填 `result`，而程序正文根本不再渲染，`job_output` 因此读不到任何程序内容）；剩下的是"**知道**"——`JobSpec` 没有让生产者退出完成通知的开关，`reported` 归注册表所有，**那一半本插件从生产方一侧抑制不了**。
 
 缓解手段：
 
@@ -274,7 +274,7 @@ DSH 的投递接口有四种形态，本设计选 followup 而非 inject：
 
 ### 7.2 执行形态、能力面与权威
 
-**程序体在 `vm` context 里求值**（照 `workflow-ptc` 的 `vm.createContext` + `vm.Script`）。它跑在 PTC 的完整 Node 子进程内，但**程序只能看见被显式注入的能力**：`flow` 命名空间（`process` / `processOrThrow` / `tmpDir`）、`console`、收窄的文件助手、`fetch`，以及语言内建。**没有** `process`、`require`、动态 `import`、`child_process`。
+**程序体在 `vm` context 里求值**（照 `workflow-ptc` 的 `vm.createContext` + `vm.Script`）。它跑在 PTC 的完整 Node 子进程内，但**程序只能看见被显式注入的能力**：`flow` 命名空间（`process` / `processOrThrow` / `tmpDir`）、收窄的文件助手、`fetch`，以及语言内建。**没有** `process`、`require`、动态 `import`、`child_process`，也**没有 `console`**——PTC 虽然把 `console` 作为形参注入程序正文，外壳却不把它挂成 vm 全局（阶段 9），程序侧的 console 输出因此没有任何消费者。
 
 **这不是安全边界。** 实测可逃逸——`this.constructor.constructor("return process")()`，以及**任何注入函数的 `.constructor`**；加 `codeGeneration: { strings: false, wasm: false }` 也堵不住。定位与 `workflow-ptc` 一致：*withheld globals guide script authors*。**扣留是为了引导，不为堵逃逸投入。**
 
@@ -390,6 +390,8 @@ UI 需要状态流，不能反过来"查"宿主，所以状态必须走事件。
 | 主 agent 的中间过程查询工具 | 单例下"启动被拒绝"已能回答这个问题 |
 
 ## 11. 与主 agent 的契约（`.d.ts` 草案）
+
+**这份草案是阶段 1 的形态，已经过期；事实来源是 `host/sdk.ts` 的 `sdkText`。** 差别在阶段 8 给 `dispatchsubagent` 加了两个可选路由字段，阶段 9 去掉了"返回值会回到主 agent"这条承诺、并把 `console` 从程序的能力面里移除。
 
 这份声明进系统提示，**就是主 agent 写程序时的 API 文档**。
 
@@ -632,6 +634,25 @@ interface ProcessOutput {
 - **仓库级 keyless 快照仍未产出（迁移欠账）**：`snapshots/AGENTS.md` 要求每个被测进程经 `dsh` CLI + 一个
   shipped profile 启动，而本插件今天是 `--patch` overlay、不在任何 shipped profile 里。本阶段用插件自己的
   golden 断言（`tests/sdk-text.spec.ts`）把 `.d.ts` 渲染文本逐字钉住；仓库那一份随迁移补。**
+
+### 阶段 9 — 适配 DSH 0.2.1，并把程序正文从交付面去掉
+
+**做什么**
+
+- 适配 0.2.1 的三处破坏性改动：`JobStart` → `JobSpec` 且 `owner` 从 `Agent` 变成 `SessionId`（消费面 `ctx.jobs.wait` / `read` / `get` 的 caller 同样换成会话 id）；`MessageSourceMap` 删掉兜底的 `plugin` kind，改为每个生产者自报；`JobOutcome.output` 与 `JobRead.text` 消失。
+- **决定（c）**：`JobOutcome` 只交终态、不填 `result`，而程序正文根本不再渲染——`return` 的值不再交付给任何人，`report` 成为唯一的内容通道。§6.4 的"主 agent 只能启动 / 取消 / 看 report"由此在**生产方一侧**成立"内容"那一半；"知道"那一半（job 的存在、终态与完成通知）仍归注册表，见 §6.4 末段。
+- 程序侧的 `console` 从能力面上移除：`host/guest-source.ts` 不再把它挂成 vm 全局，`.d.ts` 也不再声明它。PTC 仍然把 `console` 作为形参注入程序正文，但既然没有任何消费者，留在能力面上就是一个"看起来有用、实际没有后果"的 API——模型会照着写，然后什么都看不见。
+- 取消路径收成会话 id：槽位本来就按它记账，`ctx.get('agents')` 的反查去掉，顺带填掉"owner 刚被 dispose、程序仍在清理"那个窗口里把"有程序在收尾"错报成"没有程序在跑"的缺口。
+- 客户端 face 的 references 改引分面包的 `tsconfig.client.json` 叶子：引包目录（solution-only 根）必然 TS6306，而它会让整个 client program 都不被检查——"面板编译不过"会伪装成"没有诊断"。
+
+**代价（如实记账）**
+
+- "程序跑完顺手看一眼返回值"这条路径没有了，程序侧也没有 `console`；要让人看到什么，程序必须 `report`（或 `writeTextFile` 写到工作目录）。
+- 插件只能钉一条版本线：`owner` 的类型改动不是向后兼容的，同一份代码没法同时伺候 0.1.6 与 0.2.1。
+- 会话格式：0.2.1 写的是 v4，而版本检查是硬拒不是宽容读（`packages/core/session/src/index.ts`）。被 0.2.1 写过的会话旧版打不开；旧文件本身不被改写或删除，且 0.2.1 能读 v3（`session-format-v3-to-v4`）。
+- 新增的 `MessageSource.kind = 'execution-engine'` 是**持久化取值**，与版本号是两道独立的门；读取路径对未知 kind 是否宽容，本阶段**没有验证**。
+
+**验证**：A 档（两个 face 的 typecheck / `pnpm run test` / `pnpm run build` / `node --check`）+ B 档两份 fixture；面板与真实策略仍要 C 档。程序结果的取证从"读 job 输出"整体改为"程序自己 `report`"。
 
 ## 13. 待定项的结论（阶段 7 结清）
 

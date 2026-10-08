@@ -4,7 +4,7 @@
  * 三段固定文本拼成 `GUEST_SOURCE`：
  * 1. `GUEST_IMPORT_SOURCE` —— PTC 子进程里可用的 Node 内建模块句柄。PTC 的程序正文是
  *    一个 async 函数体，静态 `import` 声明不合法，所以只能动态 import。
- * 2. `CAPABILITY_SURFACE_SOURCE` —— vm 能力面（phase1-plan §3.3 方案乙）：原语、`console`、
+ * 2. `CAPABILITY_SURFACE_SOURCE` —— vm 能力面（phase1-plan §3.3 方案乙）：原语、
  *    收窄的文件助手、`fetch`。它同时也是"以引导为目的的全局扣留"：vm context 里没有
  *    Node 的 `process` / `require` / `module`。阶段 5 起四个原语在这里被包装，每次调用经
  *    `flowNamespace.trace` 向宿主上报调用点行号、实参预览与结果。
@@ -293,7 +293,6 @@ export const CAPABILITY_SURFACE_SOURCE = [
   '      return await fsPromises.access(resolved).then(function () { return true; }, function () { return false; });',
   '    },',
   '    fetch: fetch,',
-  '    console: console,',
   '  };',
   '}',
 ].join('\n')
@@ -307,6 +306,10 @@ export const GUEST_DRIVER_SOURCE = [
   'async function __dshRunProgram(flowNamespace, userProgram, options) {',
   '  var surface = __dshMakeSurface(flowNamespace, options);',
   '  var context = vm.createContext(surface, { name: "execution-engine" });',
+  '  // vm 的 realm 自带一个 console（Node 在 contextify 时装的），它**不是**我们的能力面：输出不进',
+  '  // 本次 run 的日志、也不回主 agent。留着它，"用了不存在的名字"就退化成静默的空操作；删掉它，',
+  '  // 能力面才与 `.d.ts` 一致——程序里的 console.log 会响亮地以 ReferenceError 失败。',
+  '  vm.runInContext("delete globalThis.console", context);',
   '  var script = new vm.Script("(async () => {\\n" + userProgram + "\\n})()", {',
   '    filename: "flow-program.ts",',
   '    lineOffset: -1,',
@@ -316,7 +319,8 @@ export const GUEST_DRIVER_SOURCE = [
 ].join('\n')
 
 /**
- * 固定外壳：三段拼起来即"自包含"。它引用 PTC 绑定命名空间全局 `flow` 与 PTC 提供的
- * `console`（两者都是程序正文的参数名），用户程序的字面量与调用行由 `capabilities.ts` 追加。
+ * 固定外壳：三段拼起来即"自包含"。它引用 PTC 绑定命名空间全局 `flow`（程序正文的形参之一），
+ * 用户程序的字面量与调用行由 `capabilities.ts` 追加。PTC 另外注入的 `console` 与错误类
+ * **不进程序可见面**：本插件不读程序的 console 输出（`host/engine.ts` 的 `classifyOutcome`）。
  */
 export const GUEST_SOURCE = [GUEST_IMPORT_SOURCE, CAPABILITY_SURFACE_SOURCE, GUEST_DRIVER_SOURCE].join('\n')

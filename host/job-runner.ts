@@ -41,7 +41,7 @@ import type {} from './flow-events.ts'
 import { createReportLedger } from './report-binding.ts'
 import type { ReportLedger } from './report-binding.ts'
 
-/** job 标签的上限；标签是一行摘要（`JobStart.label`），太长会污染状态行。 */
+/** job 标签的上限；标签是一行摘要（`JobSpec.label`），太长会污染状态行。 */
 const LABEL_MAX_LENGTH = 80
 
 /** 取消原因原文；注册表把它逐字转给 producer，也写进 job 的终止记录。 */
@@ -85,11 +85,14 @@ export interface ProgramJobs {
    */
   start(request: ProgramRequest): JobId
   /**
-   * 取消该发起 agent 当前在跑的程序，并在清理真正完成后返回。
-   * @param owner - 发起 agent；取消的权限范围就是它（design.md §4.2）。
+   * 取消该发起会话当前在跑的程序，并在清理真正完成后返回。
+   *
+   * 入参就是会话 id：槽位本来就按它记账，而"先反查活着的 agent 再取消"会在 owner 刚被 dispose、
+   * 程序仍在清理的那个窗口里把"有程序在收尾"错报成"没有程序在跑"。
+   * @param sessionId - 发起会话；取消的权限范围就是它（design.md §4.2）。
    * @returns 没有在跑的程序时 `{ cancelled: false }`——幂等语义在这里，不在异常里（design.md §4.4）。
    */
-  cancel(owner: Agent): Promise<ProgramCancel>
+  cancel(sessionId: SessionId): Promise<ProgramCancel>
 }
 
 /** 一次已提交程序的进程内记账；`done` 结算后整条清掉。 */
@@ -206,7 +209,9 @@ export function createProgramJobs(ctx: Context, execute: ProgramExecute): Progra
       const jobId = ctx.jobs.start({
         kind: 'execution-engine',
         label,
-        owner,
+        // 0.2.1 起 `JobSpec.owner` 就是 SessionId；旧版那支传 Agent 会让注册表按对象查 id，
+        // 直接以 `session "[object Object]" has no live agent` 拒绝。归属对象仍旧是 request.parent。
+        owner: owner.id,
         run: () => {
           // 取消的唯一来源。它可以早于 `runProgram` 建临时目录：abort 之后再跑的那一段，
           // PTC 会以 `abort` 结算，`finally` 照样把临时目录删掉。
@@ -265,8 +270,8 @@ export function createProgramJobs(ctx: Context, execute: ProgramExecute): Progra
       return jobId
     },
 
-    async cancel(owner: Agent): Promise<ProgramCancel> {
-      const entry = live.get(owner.id)
+    async cancel(sessionId: SessionId): Promise<ProgramCancel> {
+      const entry = live.get(sessionId)
       if (entry === undefined) return { cancelled: false }
       // 同步且幂等：`AbortController.abort` 重复调用无害，没有在跑的 job 时上面就返回了。
       entry.cancel(CANCEL_REASON)
@@ -367,17 +372,19 @@ function alreadyRunning(jobId: JobId): string {
  * @returns job 的终态。
  */
 function toJobOutcome(settled: Promise<RunProgramOutcome>, controller: AbortController): Promise<JobOutcome> {
+  // 只交终态，**不交程序正文**：0.2.1 的 `JobOutcome` 有 `result` 这个一次性交付位，这里故意不填，
+  // 于是通用的 `job_output` 读不到程序的返回值（design.md §6.4：主 agent 只能
+  // 启动 / 取消 / 看 report）。失败原因留在 `detail` 里，它是状态而不是内容。
   return settled.then(
     (outcome) => controller.signal.aborted
-      ? { status: 'killed', detail: cancelDetail(controller.signal.reason), output: outcome.output }
+      ? { status: 'killed', detail: cancelDetail(controller.signal.reason) }
       : {
         status: outcome.status,
         ...outcome.detail === undefined ? {} : { detail: outcome.detail },
-        output: outcome.output,
       },
     (error: unknown) => controller.signal.aborted
-      ? { status: 'killed', detail: cancelDetail(controller.signal.reason), output: `程序执行失败：${renderThrown(error)}` }
-      : { status: 'failed', detail: renderThrown(error), output: `程序执行失败：${renderThrown(error)}` },
+      ? { status: 'killed', detail: cancelDetail(controller.signal.reason) }
+      : { status: 'failed', detail: renderThrown(error) },
   )
 }
 

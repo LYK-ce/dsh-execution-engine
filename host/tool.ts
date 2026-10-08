@@ -42,8 +42,8 @@ export function createRunProgramTool(run: RunProgramExecute): ToolDefinition {
       '把一段 TypeScript 程序交给执行引擎在后台运行，立刻返回它的 job id，不阻塞你当前的回合。'
       + '每个会话同时只能有一个程序在跑：已经有程序在跑时这次启动会被拒绝，错误里带着那个 job id。'
       + '程序跑完、失败或被取消都不会通知你；要让它停下来用 cancel_program。'
-      + '程序在独立进程里运行，顶层 await 与 return 可用；'
-      + '用 process 执行外部程序，用 flow.tmpDir 读写中间文件，用 console 输出诊断文本。'
+      + '程序在独立进程里运行，顶层 await 与 return 可用；return 的值不会回到你这里，程序里也没有 console。'
+      + '用 process 执行外部程序，用 flow.tmpDir 读写中间文件，用 report 把进展发回发起会话。'
       + '所有外部执行都交给 process，超时与进程树清理由引擎负责。',
     parameters: {
       code: {

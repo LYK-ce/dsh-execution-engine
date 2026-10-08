@@ -16,10 +16,17 @@
  */
 
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { ContentBlock, MessageId, UserMessage } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, ContextFormed, MessageId, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { PtcBindingFunction, PtcJsonValue } from '@deepseek-ai/dsh-ptc-runtime'
 
-/** 本插件的 Loader 名，也是 report 消息 `source.plugin` 的取值。 */
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    /** 本插件发出的 report 消息；`form: 'notice'` 加一行折叠摘要，形态照 `tool-jobs`。 */
+    'execution-engine': { kind: 'execution-engine' } & ContextFormed
+  }
+}
+
+/** 本插件的 Loader 名；report 的 `source.kind` 与它同名（上面那条声明合并登记了它）。 */
 export const REPORT_PLUGIN = 'execution-engine'
 
 /**
@@ -28,12 +35,7 @@ export const REPORT_PLUGIN = 'execution-engine'
  */
 export type ReportMessageFactory = (input: {
   readonly content: ContentBlock[]
-  readonly source: {
-    readonly kind: 'plugin'
-    readonly plugin: string
-    readonly form: 'notice'
-    readonly summary: string
-  }
+  readonly source: { readonly kind: 'execution-engine' } & ContextFormed
 }) => UserMessage
 
 /** 一条已经投递出去的 report。 */
@@ -131,8 +133,7 @@ export function createReportBindings(options: ReportBindingOptions): Record<stri
       const message = options.createMessage({
         content: [{ type: 'text', text }],
         source: {
-          kind: 'plugin',
-          plugin: REPORT_PLUGIN,
+          kind: 'execution-engine',
           form: 'notice',
           summary: options.boundSummary(text),
         },

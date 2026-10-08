@@ -4,12 +4,15 @@
  * 模型可见 schema 存在、`.d.ts` 系统提示段进了装配结果，并真的跑几段程序。
  *
  * 阶段 3 起 `run_program` 是**后台 job**：工具立刻返回 `{ jobId, status: 'running' }`，程序在
- * 后台继续跑。所以每个用例都是两段——(1) 断言工具立刻返回，(2) 等 job 结算后从 job 输出里取回
- * 程序结果。阶段 1/2 对程序结果的断言（B1 的 `EE_OK`、B2 的退出码/超时、B6 的文本与归属）原样保留。
+ * 后台继续跑。所以每个用例都是两段——(1) 断言工具立刻返回，(2) 等 job 结算，再从发起者收件箱里取回
+ * 程序**这次 report 回来的正文**。阶段 1/2 对程序结果的断言（B1 的 `EE_OK`、B2 的退出码/超时、
+ * B6 的文本与归属）原样保留。
  *
- * 读取路径（phase3-plan §11 Q1 裁决丙）：本阶段**不给模型任何读取工具**，所以驱动走的是
- * `ctx.jobs` 自己的契约——`wait` 等终态、`read` 取输出，`caller` 就是发起本次 run 的那个 agent
- * 实例（注册表按 owner 的会话 id 授权）。
+ * 读取路径（phase3-plan §11 Q1 裁决丙）：本阶段**不给模型任何读取工具**。程序正文（`return` 值）
+ * 不交付给任何人——job 的输出 ring 恒空、`result` 恒 undefined（`host/engine.ts`
+ * 只留 `classifyOutcome`）。所以驱动走两条：`ctx.jobs.wait(id, timeoutMs, caller)` 只等终态，
+ * `caller` 是发起本次 run 的**会话 id**（注册表按 owner 的会话 id 授权）；程序要交给驱动的内容由
+ * 程序自己 `report(...)` 投进发起者的挂起队列（`makeAgent` 的 `pending`，模块级经 `pendingOf` 读）。
  *
  * 分支由传入 fixture 解析出的沙箱模式决定（见 sandboxMode），不引入额外开关：
  *
@@ -72,7 +75,7 @@ import { join, sep } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { boot, resolveConfigPath } from '@deepseek-ai/dsh-app-boot'
-import type { JobId } from '@deepseek-ai/dsh-jobs'
+import type { JobId, JobStatus, JobView } from '@deepseek-ai/dsh-jobs'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { MessageId, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { FlowCallEndEvent, FlowCallStartEvent, FlowStartEvent } from '../host/flow-events.ts'
@@ -81,11 +84,9 @@ import type { FlowCallEntry, FlowReportEntry, FlowSnapshot } from '../shared/pro
 import { FAILURE_DIAGNOSTIC, FAILURE_MARKER, SCRIPTED_REPLY, scriptedStarts } from './fixtures/scripted-subagent-provider.ts'
 import * as plugin from '../host/index.ts'
 
-/** run_program 结果里返回值小节的固定前缀（host/engine.ts 的渲染）。 */
-const VALUE_MARKER = '程序返回值：\n'
-
-/** run_program 结果里失败小节的固定前缀（host/engine.ts 的渲染）。 */
-const PROGRAM_FAILURE_MARKER = '程序执行失败（'
+// 驱动要读值的程序把值 `report(JSON.stringify(...))` 回来，正文落在发起者的挂起队列里
+// （`host/report-binding.ts` 的投递，`returned` 负责解析）。程序正文经 job 交付的那条路已经不存在
+// （`host/engine.ts` 只留 `classifyOutcome`），所以这里没有返回值小节或失败小节可切。
 
 /** 每次调用一个不同的 id，便于在日志里对上。 */
 let callSeq = 0
@@ -214,11 +215,17 @@ function liveRunDirs(): string[] {
 }
 
 /**
+ * 每个替身发起者的收件箱，`makeAgent` 建的时候登记进来。读取面（`pendingOf`）在模块级，
+ * 大多数用例用的又是默认的 `owner = initiator`，登记一次就不必把收件箱逐个参数传下去。
+ */
+const inboxes = new WeakMap<Agent, UserMessage[]>()
+
+/**
  * 建一个真的发起 agent：真 Session + 自己的 scope fiber + 注册进 `ctx.agents`。
  *
  * 阶段 3 起发起者同时是 job 的 owner，而 owner 必须是**注册表里活着的那个实例**——
- * jobs-local 的 `ensureOwnerCleanup` 比对 `agents.get(id) === owner`，不等就拒绝
- * （packages/jobs/jobs-local/src/index.ts:448-456）。所以不能再用一个只有 id 的替身。
+ * jobs-local 的 `resolveOwner` 按会话 id 取 `agents.get(id)`，取不到就拒绝
+ * （packages/jobs/jobs-local/src/index.ts:353-368）。所以不能再用一个只有 id 的替身。
  *
  * 注册表 disposal 与 scope disposal 是两件事：前者摘掉注册记录，后者才是"会话关闭"，
  * job 的 drain 挂在后者上（先例 packages/jobs/tool-jobs/tests/tool-jobs.spec.ts:44-71）。
@@ -227,6 +234,7 @@ function liveRunDirs(): string[] {
  * （`host/report-binding.ts`）。真身是 agent-loop 的 `ReactLoopInbox`，但本驱动不挂
  * `dsh-agent-loop`（它要模型 route、会话持久化一整套），所以这里按契约做最小实现：投进来的消息
  * **一直挂着、不被领取**——那正是"主 agent 正忙、还没走到下一个 turn"的那一段，也是 B12 要的形态。
+ * 收件箱同时登记进模块级的 `inboxes`，供 `pendingOf` 读。
  * @param label - 会话 id 用的前缀，便于在日志里区分。
  * @returns 发起者、它自己的 scope fiber，以及收件箱里挂着的消息（按投递顺序）。
  */
@@ -252,6 +260,7 @@ async function makeAgent(label: string) {
   } as unknown as Agent
   await agents.register(agent)
   assert.equal(agents.get(session.id), agent, `${label}: the owner must be the registered instance`)
+  inboxes.set(agent, pending)
   return { agent, scope, pending }
 }
 
@@ -272,12 +281,14 @@ function callCancelProgram(owner?: Agent) {
   return callTool('cancel_program', {}, owner)
 }
 
-/** 一次 run_program 调用：job id、返回时的状态、模型可见文本与调用耗时。 */
+/** 一次 run_program 调用：job id、返回时的状态、模型可见文本、调用耗时与提交前的收件箱水位。 */
 interface ProgramStart {
   readonly jobId: string
   readonly status: string
   readonly text: string
   readonly elapsedMs: number
+  /** 提交之前该发起者挂起队列的长度：本次 run 的 report 就是它之后新增的那些。 */
+  readonly pendingBefore: number
 }
 
 /**
@@ -287,9 +298,11 @@ interface ProgramStart {
  * 见 `host/tool.ts` 的 `render`）。
  * @param code - 程序源码。
  * @param owner - 发起者；缺省用 `initiator`。
- * @returns job id、状态、文本与耗时。
+ * @returns job id、状态、文本、耗时与提交前的收件箱水位。
  */
 async function startProgram(code: string, owner: Agent = initiator): Promise<ProgramStart> {
+  // 水位要在提交之前取：程序一旦跑起来，第一条 report 可能先于工具返回就落地了。
+  const pendingBefore = pendingOf(owner).length
   const startedAt = Date.now()
   const result = await callRunProgram(code, owner)
   const elapsedMs = Date.now() - startedAt
@@ -298,45 +311,122 @@ async function startProgram(code: string, owner: Agent = initiator): Promise<Pro
   const value = result.value as { jobId: string; status: string }
   assert.equal(value.status, 'running', `run_program must return a live job:\n${text}`)
   assert.ok(text.includes(value.jobId), `the rendered content must name the job:\n${text}`)
-  return { jobId: value.jobId, status: value.status, text, elapsedMs }
+  return { jobId: value.jobId, status: value.status, text, elapsedMs, pendingBefore }
 }
 
 /**
- * 等一个 job 结算，并从它的输出里取回程序结果（阶段 3 的读取路径，见文件头）。
+ * 一次 run 的结局：程序自己 report 回来的正文，加上 job 的结算终态。
  *
- * `caller` 必须是发起本次 run 的那个 agent 实例：注册表按 owner 的会话 id 授权，换一个 caller
- * 会直接抛 "belongs to another session"（packages/jobs/jobs-local/src/index.ts:356-360）。
- * @param jobId - `run_program` 交回的 id。
- * @param owner - 发起者。
- * @param timeoutMs - 等待上界；超了就是判据没跑成，不是判据失败。
- * @returns 程序结果的渲染文本。
+ * 这两项就是驱动能观察到的全部：程序正文不走 job（`host/engine.ts` 只留 `classifyOutcome`），
+ * 所以"读值"与"判成败"分别从 `reports` 与 `status` 取。
  */
-async function jobOutput(jobId: string, owner: Agent = initiator, timeoutMs = 120_000): Promise<string> {
+interface ProgramRun {
+  /** 本次 run 新增的 report 正文，按程序调用顺序；程序没报就是空数组。 */
+  readonly reports: readonly string[]
+  /** job 的结算终态（`completed` / `failed` / `killed`）。 */
+  readonly status: JobStatus
+  /** 终态说明（失败原因、取消原因）；正常完成时缺席。 */
+  readonly detail?: string
+}
+
+/**
+ * 一个替身发起者收到的、还没被领取的消息（按投递顺序）。活的数组，读它不必复制。
+ * @param owner - `makeAgent` 造出来的那个实例。
+ * @returns 它的挂起队列。
+ * @throws `owner` 不是 `makeAgent` 造出来的实例时。
+ */
+function pendingOf(owner: Agent): UserMessage[] {
+  const pending = inboxes.get(owner)
+  if (pending === undefined) throw new Error('pendingOf requires an agent made by makeAgent')
+  return pending
+}
+
+/**
+ * 一条 report 消息的正文。
+ *
+ * 这里只取正文：投递形态（`source.kind` / `form` / `summary`）的强断言在危险分支的 `reportText`
+ * 里（B11/B12 用它），模块级助手不该依赖那个块级函数。
+ * @param message - 发起者收件箱里的一条消息。
+ * @returns 消息的文本正文。
+ */
+function reportBody(message: UserMessage): string {
+  const block = message.content[0]
+  if (block === undefined || block.type !== 'text') throw new Error('a report carries one text block')
+  return block.text
+}
+
+/**
+ * 等一个 job 结算（阶段 3 的读取路径，见文件头）。
+ *
+ * `caller` 是发起本次 run 的**会话 id**：注册表按 owner 的会话 id 授权，换一个 caller 会直接抛
+ * "belongs to another session"（packages/jobs/jobs-local/src/index.ts:401-410）。只等终态，不读
+ * 内容——ring 恒空、`result` 恒 undefined。
+ * @param jobId - `run_program` 交回的 id。
+ * @param owner - 发起者；它的 `id` 就是 caller。
+ * @param timeoutMs - 等待上界；超了就是判据没跑成，不是判据失败。
+ * @returns 结算后的 job 视图。
+ */
+async function jobSettled(jobId: string, owner: Agent = initiator, timeoutMs = 120_000): Promise<JobView> {
   const id = jobId as unknown as JobId
-  const snapshot = await ctx.jobs.wait(id, timeoutMs, owner)
+  const snapshot = await ctx.jobs.wait(id, timeoutMs, owner.id)
   assert.ok(
     snapshot.status !== 'running' && snapshot.status !== 'stopping',
     `job ${jobId} did not settle within ${String(timeoutMs)}ms (status ${snapshot.status})`,
   )
-  return ctx.jobs.read(id, owner).text
+  return snapshot
 }
 
-/** 跑完一段程序并取回渲染结果——B1–B6 的判据原样保留，只是改从 job 输出里取。 */
-async function runToCompletion(code: string, owner?: Agent): Promise<string> {
-  const started = await startProgram(code, owner)
-  return await jobOutput(started.jobId, owner ?? initiator)
+/**
+ * 等一次 run 结算，并取回**本次 run** 报告回来的正文。
+ *
+ * 收件箱是跨 run 累积的，所以按提交前记下的水位切：`pendingBefore` 之后新增的才是这次 run 的。
+ * 永远取最后一条不行——"这次什么都没报"会读成上一次 run 的 report 而假通过。
+ * @param started - 这次提交的观察量（含提交前的收件箱水位）。
+ * @param owner - 发起者；它的收件箱就是 report 的落点。
+ * @returns 本次 run 的 report 正文与结算终态。
+ */
+async function collectRun(started: ProgramStart, owner: Agent): Promise<ProgramRun> {
+  const job = await jobSettled(started.jobId, owner)
+  const reports = pendingOf(owner).slice(started.pendingBefore).map(reportBody)
+  return { reports, status: job.status, ...job.detail === undefined ? {} : { detail: job.detail } }
 }
 
-/** 程序失败只体现在文本里（工具结果不带 isError 字段）。 */
-function assertProgramSucceeded(output: string, label: string): void {
-  assert.ok(!output.includes(PROGRAM_FAILURE_MARKER), `${label}: the program failed:\n${output}`)
+/**
+ * 跑完一段程序，并取回它报告回来的正文与结算终态——B1–B6 的判据原样保留，只是值的来路变了。
+ * @param code - 程序源码。
+ * @param owner - 发起者；缺省用 `initiator`。
+ * @returns 本次 run 的 report 正文与终态。
+ */
+async function runToCompletion(code: string, owner: Agent = initiator): Promise<ProgramRun> {
+  return await collectRun(await startProgram(code, owner), owner)
 }
 
-/** 从渲染文本的尾部取回程序返回值。 */
-function returned(output: string): unknown {
-  const index = output.lastIndexOf(VALUE_MARKER)
-  assert.ok(index >= 0, `run_program output has no return-value section:\n${output}`)
-  return JSON.parse(output.slice(index + VALUE_MARKER.length))
+/**
+ * 程序跑完了没有。判据是 job 的结算终态——程序失败不再是文本里的一节，而是 `failed` 终态
+ * （`host/engine.ts` 的 `classifyOutcome` 把原因留在 `detail` 里），所以这一条仍能拦住失败的 run。
+ * @param output - 一次 run 的终态；`ProgramRun` 与 job 视图都有 `status`，两种都收。
+ * @param label - 断言失败时的用例名。
+ */
+function assertProgramSucceeded(output: { readonly status: JobStatus }, label: string): void {
+  assert.equal(output.status, 'completed', `${label}: the program did not complete (status ${output.status})`)
+}
+
+/**
+ * 从程序报告回来的正文里取回返回值。
+ *
+ * 驱动要读值的程序用 `report(JSON.stringify(<表达式>))` 报一次；取**最后一条**，好让先报流程
+ * 消息、再报值的程序也能用同一条读取路径。
+ * @param output - 一次 run 的 report 正文与终态。
+ * @returns 解析出来的值。
+ */
+function returned(output: ProgramRun): unknown {
+  const last = output.reports.at(-1)
+  assert.ok(
+    last !== undefined,
+    `the program reported no value to read (status ${output.status}`
+    + `${output.detail === undefined ? '' : `, detail ${output.detail}`})`,
+  )
+  return JSON.parse(last)
 }
 
 /** 进程是否还活着：0 号信号只探存在性，不投递。 */
@@ -383,7 +473,7 @@ try {
   const sdk = assembly.sections.find(section => section.name === 'execution-engine-sdk')
   assert.ok(sdk !== undefined, 'the execution-engine-sdk prompt section is not registered')
   assert.equal(sdk.interpolate, false, 'the SDK text must not be interpolated')
-  for (const declaration of ['declare function dispatchsubagent(', 'declare function report(', 'declare function process(', 'declare function processOrThrow(', 'flow.tmpDir', 'declare const console', 'cancel_program']) {
+  for (const declaration of ['declare function dispatchsubagent(', 'declare function report(', 'declare function process(', 'declare function processOrThrow(', 'flow.tmpDir', 'cancel_program']) {
     assert.ok(sdk.text.includes(declaration), `the SDK section must declare ${declaration}`)
   }
 
@@ -429,7 +519,7 @@ try {
     // ---- B1：程序能跑，process 真的执行外部程序 -------------------------------
     const b1 = await runToCompletion(`
 const r = await process(['python', '-c', 'print("EE_OK")'])
-return { ok: r.code === 0 && r.stdout.trim() === 'EE_OK', code: r.code, out: r.stdout.trim() }
+await report(JSON.stringify({ ok: r.code === 0 && r.stdout.trim() === 'EE_OK', code: r.code, out: r.stdout.trim() }))
 `)
     assertProgramSucceeded(b1, 'B1')
     assert.deepEqual(returned(b1), { ok: true, code: 0, out: 'EE_OK' })
@@ -440,13 +530,13 @@ return { ok: r.code === 0 && r.stdout.trim() === 'EE_OK', code: r.code, out: r.s
     // （phase3-plan R6）。
     const b1b = await startProgram(`
 await process(['python', '-c', 'import time; time.sleep(4)'])
-return 'EE_SLOW_DONE'
+await report(JSON.stringify('EE_SLOW_DONE'))
 `)
     assert.ok(
       b1b.elapsedMs < 2_000,
       `B1b: run_program took ${String(b1b.elapsedMs)}ms — it waited for the program instead of returning`,
     )
-    const b1bOutput = await jobOutput(b1b.jobId)
+    const b1bOutput = await collectRun(b1b, initiator)
     assertProgramSucceeded(b1bOutput, 'B1b')
     assert.equal(returned(b1bOutput), 'EE_SLOW_DONE', 'the background program must still have run to completion')
     process.stdout.write(`B1b run_program returns immediately: OK (returned in ${String(b1b.elapsedMs)}ms)\n`)
@@ -454,7 +544,7 @@ return 'EE_SLOW_DONE'
     // ---- B2：非零退出码正常返回、processOrThrow 抛出、超时生效 ----------------
     const b2a = await runToCompletion(`
 const r = await process(['python', '-c', 'import sys; sys.exit(3)'])
-return { code: r.code, timedOut: r.timedOut, stderr: r.stderr }
+await report(JSON.stringify({ code: r.code, timedOut: r.timedOut, stderr: r.stderr }))
 `)
     assertProgramSucceeded(b2a, 'B2a')
     assert.equal((returned(b2a) as { code: number }).code, 3, 'a non-zero exit code must be returned normally')
@@ -462,9 +552,9 @@ return { code: r.code, timedOut: r.timedOut, stderr: r.stderr }
     const b2b = await runToCompletion(`
 try {
   await processOrThrow(['python', '-c', 'import sys; sys.exit(3)'])
-  return { threw: false }
+  await report(JSON.stringify({ threw: false }))
 } catch (error) {
-  return { threw: true, message: String(error && error.message) }
+  await report(JSON.stringify({ threw: true, message: String(error && error.message) }))
 }
 `)
     assertProgramSucceeded(b2b, 'B2b')
@@ -475,7 +565,7 @@ try {
     const timeoutStart = Date.now()
     const b2c = await runToCompletion(`
 const r = await process(['python', '-c', 'import time; time.sleep(30)'], { timeoutMs: 1000 })
-return { timedOut: r.timedOut, code: r.code }
+await report(JSON.stringify({ timedOut: r.timedOut, code: r.code }))
 `)
     const timeoutElapsedMs = Date.now() - timeoutStart
     assertProgramSucceeded(b2c, 'B2c')
@@ -494,9 +584,9 @@ try {
     ['python', '-c', 'import pathlib,sys; pathlib.Path(sys.argv[1]).write_text("started")', ${JSON.stringify(b3Sentinel)}],
     { timeoutMs: 10000000 },
   )
-  return { rejected: false }
+  await report(JSON.stringify({ rejected: false }))
 } catch (error) {
-  return { rejected: true, message: String(error && error.message) }
+  await report(JSON.stringify({ rejected: true, message: String(error && error.message) }))
 }
 `)
     assertProgramSucceeded(b3, 'B3')
@@ -530,7 +620,7 @@ const r = await process(
   ['python', ${JSON.stringify(forkerScript)}, ${JSON.stringify(b4Sentinel)}, ${JSON.stringify(orphanScript)}],
   { timeoutMs: 1000 },
 )
-return { timedOut: r.timedOut }
+await report(JSON.stringify({ timedOut: r.timedOut }))
 `)
     const b4ElapsedMs = Date.now() - b4Start
     assertProgramSucceeded(b4, 'B4')
@@ -548,11 +638,11 @@ return { timedOut: r.timedOut }
     // ---- B6：洞与归属 ---------------------------------------------------------
     // 判据 1 + 4：程序里两次 `dispatchsubagent` 各拿回脚本化 provider 的固定文本，而该 provider
     // 之所以被调用，是因为 fixture 把 `subagentProvider` 配成了 `scripted`——配错成没注册的名字时
-    // `ctx.subagents.start` 会直接拒绝，这段程序会以失败小节收场，下面第一条断言就会拦住。
+    // `ctx.subagents.start` 会直接拒绝，这段程序会以 `failed` 终态收场，下面第一条断言就会拦住。
     const b6 = await runToCompletion(`
 const first = await dispatchsubagent('scripted one')
 const second = await dispatchsubagent('scripted two')
-return { first, second }
+await report(JSON.stringify({ first, second }))
 `)
     assertProgramSucceeded(b6, 'B6')
     assert.deepEqual(returned(b6), { first: SCRIPTED_REPLY, second: SCRIPTED_REPLY })
@@ -578,9 +668,9 @@ return { first, second }
     const b6Failure = await runToCompletion(`
 try {
   await dispatchsubagent(${JSON.stringify(`${FAILURE_MARKER} this one must fail`)})
-  return { threw: false }
+  await report(JSON.stringify({ threw: false }))
 } catch (error) {
-  return { threw: true, message: String(error && error.message) }
+  await report(JSON.stringify({ threw: true, message: String(error && error.message) }))
 }
 `)
     assertProgramSucceeded(b6Failure, 'B6-failure')
@@ -601,7 +691,7 @@ try {
     // 只给 model 的措辞与 `list_subagent_models` 一致。前两段的观察点是脚本化 provider 记下的
     // `agentOptions`——它声明了 `agentOptions` 能力位，所以请求真的到得了它（否则 service 先拒）。
     // ROUTE 必须与 fixtures/cordis.yml 的 `allowedModels` 一致；不一致时第一段 dispatch 就会抛，
-    // 程序以失败小节收场，下面第一条断言当场拦住。
+    // 程序以 `failed` 终态收场，下面第一条断言当场拦住。
     const ROUTE = { provider: 'scripted-provider', model: 'scripted-model' }
     const startsBeforeB15 = scriptedStarts().length
     const b15 = await runToCompletion(`
@@ -619,7 +709,7 @@ try {
 } catch (error) {
   half = String(error && error.message)
 }
-return { routed, plain, denied, half }
+await report(JSON.stringify({ routed, plain, denied, half }))
 `)
     assertProgramSucceeded(b15, 'B15')
     const b15Value = returned(b15) as { routed: string; plain: string; denied: string; half: string }
@@ -678,8 +768,8 @@ return 'A_FINISHED'
     assert.deepEqual(liveRunDirs(), [], 'B7: cancelling A must have removed its run temporary directory')
 
     // A 结算之后可以立刻启动 B，不会出现两个并存。
-    const b7b = await startProgram('return "B_OK"')
-    const b7bOutput = await jobOutput(b7b.jobId)
+    const b7b = await startProgram('await report(JSON.stringify("B_OK"))')
+    const b7bOutput = await collectRun(b7b, initiator)
     assertProgramSucceeded(b7bOutput, 'B7-b')
     assert.equal(returned(b7bOutput), 'B_OK')
     assert.deepEqual(liveRunDirs(), [], 'B7: B must have cleaned up after itself too')
@@ -746,12 +836,12 @@ return 'never'
     assert.equal(b10.status, 'running')
 
     // 用户关掉会话 = 发起 agent 的 scope 被 dispose。注册表的契约是"owner disposal 取消并 await
-    // 这个 job"（packages/jobs/jobs/src/types.ts:56-62），所以 dispose 返回时清理已经完成。
+    // 这个 job"（packages/jobs/jobs/src/types.ts:126-137），所以 dispose 返回时清理已经完成。
     await retiring.scope.dispose()
 
     assert.deepEqual(liveRunDirs(), [], 'B10: disposing the owner must leave no run temporary directory')
     assert.throws(
-      () => ctx.jobs.get(b10.jobId as unknown as JobId, retiring.agent),
+      () => ctx.jobs.get(b10.jobId as unknown as JobId, retiring.agent.id),
       /unknown job/,
       'B10: the owner disposal must have removed the job record',
     )
@@ -798,16 +888,18 @@ return 'never'
 
     /**
      * 一条 report 消息的正文，顺带钉住投递形态（`host/report-binding.ts` 的 source 契约）。
+     *
+     * 这条是**强版本**，只在本分支里给 B11/B12 用；模块级的 `reportBody` 没有这些断言，
+     * 因为块级函数出不了这个分支。
      * @param message - 发起者收件箱里的一条消息。
      * @param label - 断言失败时的用例名。
      * @returns 消息的文本正文。
      */
     function reportText(message: UserMessage, label: string): string {
       const source = message.source
-      if (source.kind !== 'plugin') {
-        throw new Error(`${label}: a report must be plugin-sourced, got ${source.kind}`)
+      if (source.kind !== 'execution-engine') {
+        throw new Error(`${label}: a report must be execution-engine-sourced, got ${source.kind}`)
       }
-      assert.equal(source.plugin, 'execution-engine', `${label}: the report must name this plugin`)
       assert.equal(source.form, 'notice', `${label}: a report is a notice`)
       if (source.form !== 'notice') throw new Error(`${label}: unreachable`)
       // 一行折叠摘要：既不能是空串，也不能把整段 report 塞进去（CONTEXT_SUMMARY_MAX_CHARS = 120）。
@@ -847,9 +939,8 @@ await report('two')
 return 'B11_DONE'
 `
     const b11 = await startProgram(b11Program, reporter.agent)
-    const b11Output = await jobOutput(b11.jobId, reporter.agent)
-    assertProgramSucceeded(b11Output, 'B11')
-    assert.equal(returned(b11Output), 'B11_DONE')
+    // 这里不再读 job：这次 run 的观察面就是下面的收件箱与 `flow/*` 事件。终态由 `flow/end` 逐字
+    // 断言（`status: 'completed'`），"跑完了没有"因此没有缺口。
     await waitFor(() => eventsOf(flowEnd, b11.jobId).length >= 1, 20_000, 'B11')
 
     // 判据 1：两条 report 都进了发起者的收件箱，顺序**就是**程序调用的顺序（design.md §6.2）。
@@ -913,6 +1004,11 @@ return 'B12_DONE'
     // ---- B13：执行位置上报（阶段 5） -------------------------------------------
     // 行号判据写死，不用"大于 0"：下面的数组就是行号表，每条原语调用对照它在数组里的位置
     // （1-based）。`lineOffset: -1` 抵掉编译包装那一行前缀，所以栈里的行号就是这里的行号。
+    //
+    // 驱动要读的值（`code` / `failed` / `visible` / `flowKeys`）由程序在最后一行自己 `report`
+    // 回来：`return {...}` 已经没人看得到。首选方案"从 `flow/call-end` 的 `result` 预览里解析"
+    // 在这里不够用——预览只拿得到 `code` 与 `failed`，`visible` / `flowKeys` 这两个值只有程序自己
+    // 报得出来。代价是行号表比原来多一条 `['report', 12]`（`report` 也是一次原语调用）。
     const b13Program = [
       "const ok = await process(['python', '-c', 'print(1)'])",                  // 1
       "await report('b13')",                                                     // 2
@@ -925,16 +1021,16 @@ return 'B12_DONE'
       '} catch (error) {',                                                       // 9
       '  failed = String(error && error.message)',                               // 10
       '}',                                                                       // 11
-      'return {',                                                                // 12
+      'await report(JSON.stringify({',                                           // 12
       '  code: ok.code,',                                                        // 13
       '  failed,',                                                               // 14
       '  visible: Object.getOwnPropertyNames(globalThis),',                      // 15
       '  flowKeys: Object.getOwnPropertyNames(flow).join(","),',                 // 16
-      '}',                                                                       // 17
+      '}))',                                                                     // 17
     ].join('\n')
     const traced = await makeAgent('traced')
     const b13 = await startProgram(b13Program, traced.agent)
-    const b13Output = await jobOutput(b13.jobId, traced.agent)
+    const b13Output = await collectRun(b13, traced.agent)
     assertProgramSucceeded(b13Output, 'B13')
     const b13Value = returned(b13Output) as {
       code: number
@@ -956,7 +1052,7 @@ return 'B12_DONE'
     // 判据 1：行号写死比对。循环里同一行出现三次，所以 process 在源码第 4 行上出现三次——
     // 重复是正常的，不去重（design.md §8.3 的"轨迹"要的就是这个）。
     await waitFor(
-      () => eventsOf(callStart, b13.jobId).length >= 6 && eventsOf(callEnd, b13.jobId).length >= 6,
+      () => eventsOf(callStart, b13.jobId).length >= 7 && eventsOf(callEnd, b13.jobId).length >= 7,
       20_000,
       'B13',
     )
@@ -971,6 +1067,7 @@ return 'B12_DONE'
         ['process', 4],
         ['process', 4],
         ['processOrThrow', 8],
+        ['report', 12],
       ],
       'B13: every reported line must equal its line in the submitted program',
     )
@@ -996,14 +1093,14 @@ return 'B12_DONE'
     // 判据 4：失败路径也闭合，且分类是 error（`processOrThrow` 的非零退出码）。
     assert.deepEqual(
       b13Ends.map(event => event.outcome),
-      ['ok', 'ok', 'ok', 'ok', 'ok', 'error'],
+      ['ok', 'ok', 'ok', 'ok', 'ok', 'error', 'ok'],
       'B13: only the failing processOrThrow may end as an error',
     )
     assert.match(String(b13Ends[5]?.error), /exited with code 3/)
     assert.equal(b13Ends[5]?.result, undefined, 'B13: a failed call must not carry a result')
 
     // 判据 3（预览面）：参数与结果都在事件里，且有界标记在场。
-    assert.deepEqual(b13Starts.map(event => event.argsTruncated), [false, false, false, false, false, false])
+    assert.deepEqual(b13Starts.map(event => event.argsTruncated), [false, false, false, false, false, false, false])
     assert.match(String(b13Starts[0]?.args), /\[\["python","-c","print\(1\)"\]\]/)
     assert.match(String(b13Ends[0]?.result), /"code":0/)
     for (const event of b13Ends) assert.ok(event.ms >= 0, 'B13: every call-end must report a non-negative duration')
@@ -1075,8 +1172,9 @@ return r.code
     ].join('\n')
     const routed = await makeAgent('routed')
     const b14 = await startProgram(b14Program, routed.agent)
-    const b14Output = await jobOutput(b14.jobId, routed.agent)
-    assertProgramSucceeded(b14Output, 'B14')
+    // 不改 B14 的程序：多一行 `report` 就会破下面 `lineCount === 7` 的判据。这里只等结算。
+    const b14Job = await jobSettled(b14.jobId, routed.agent)
+    assertProgramSucceeded(b14Job, 'B14')
     await waitFor(() => eventsOf(flowEnd, b14.jobId).length >= 1, 20_000, 'B14')
 
     const first = await panelState(routed.agent.id)
@@ -1182,7 +1280,7 @@ return r.code
     // 这一条先把"受限组合跑不起来"和"边界没生效"分开。
     const preflight = await runToCompletion(`
 const r = await process(['python', '-c', 'print("EE_OK")'])
-return { code: r.code, out: r.stdout.trim(), stderr: r.stderr.slice(-200) }
+await report(JSON.stringify({ code: r.code, out: r.stdout.trim(), stderr: r.stderr.slice(-200) }))
 `)
     assertProgramSucceeded(preflight, 'B5-pre')
     const pre = returned(preflight) as { code: number; out: string; stderr: string }
@@ -1256,7 +1354,7 @@ async function attempt(path) {
   const result = await process(['python', '-c', python, path])
   return { code: result.code, timedOut: result.timedOut, stdout: result.stdout, stderr: result.stderr.slice(-800) }
 }
-return { outside: await attempt(targets.outside), inside: await attempt(targets.inside) }
+await report(JSON.stringify({ outside: await attempt(targets.outside), inside: await attempt(targets.inside) }))
 `)
     assertProgramSucceeded(b5, 'B5')
     const attempts = returned(b5) as Record<'outside' | 'inside', {

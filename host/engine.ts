@@ -3,7 +3,8 @@
  *
  * 引擎负责四件事：组装程序正文（外壳 + 用户源码）、把 `dispatchsubagent`、
  * `process` / `processOrThrow`、`report` 与内部的 `trace` 作为 `flow` 绑定命名空间挂上、
- * **让一次 run 的在飞外部执行在 run 结束前真正静默**（阶段 3）、把 PTC 的结果渲染成模型可读文本。
+ * **让一次 run 的在飞外部执行在 run 结束前真正静默**（阶段 3）、把 PTC 的结果归类成 job 的终态。
+ * 程序正文（返回值）**不回主 agent**，程序侧也没有 `console`，见 {@link RunProgramOutcome}。
  * 程序失败**不是**异常——它是结果里的一个字段（design.md §3.3 的同一条理由）。
  *
  * `trace` 是阶段 5 加的内部通道：外壳的包装函数经它上报调用点位置，本模块把它折成
@@ -112,10 +113,11 @@ export interface RunProgramDeps {
   readonly warn: (message: string) => void
 }
 
-/** 一次 `run_program` 的模型可见结果。 */
+/**
+ * 一次 `run_program` 的结局分类。**程序正文不在这里**：返回值不交出去
+ * （design.md §6.4——主 agent 只能启动 / 取消 / 看 `report`），进 job 注册表的只有下面的终态。
+ */
 export interface RunProgramOutcome {
-  /** 给模型看的文本：程序的返回值、程序自己写的输出，或失败原因。 */
-  readonly output: string
   /**
    * 程序自己的结局。取消不在这里表达——那是 job 层对信号的判断（`host/job-runner.ts` 的
    * `toJobOutcome`），引擎这一层只分得清"跑完了"和"程序自己失败了"。
@@ -136,7 +138,7 @@ export interface RunProgramOutcome {
  * 取消路径上的逐跳位置见 {@link trackExternalWork} 的说明。
  * @param deps - PTC / subprocess / subagents / sandbox 执行缝与部署的策略。
  * @param request - 程序正文、cwd、发起者、可选的已解析文件策略、取消信号、report 记账。
- * @returns 渲染好的模型可见结果与程序自己的结局分类。
+ * @returns 程序自己的结局分类；程序正文不在返回值里。
  */
 export async function runProgram(deps: RunProgramDeps, request: RunProgramRequest): Promise<RunProgramOutcome> {
   const tmpDir = await createRunTmpDir(request.cwd, randomUUID())
@@ -179,7 +181,7 @@ export async function runProgram(deps: RunProgramDeps, request: RunProgramReques
       ...request.sandboxPolicy === undefined ? {} : { sandboxPolicy: request.sandboxPolicy },
       signal: request.signal,
     }))
-    return renderOutcome(result)
+    return classifyOutcome(result)
   } finally {
     await external.drain()
     await removeRunTmpDir(tmpDir, deps.warn)
@@ -187,30 +189,17 @@ export async function runProgram(deps: RunProgramDeps, request: RunProgramReques
 }
 
 /**
- * 把 PTC 结果渲染成模型可读文本。捕获输出在前、完成值在最后：值是这个工具的结果，
- * 放在尾部读起来是结论，也让"从尾部取返回值"这类消费者有一个稳定的落点。
- * 失败种类与原因是结果文本的一部分，不是异常路径，也不是工具失败标记。
+ * 把 PTC 结果归类成 job 的终态。**不渲染程序正文**：程序的 `return` 值不进
+ * job 注册表，所以 `job_output` 那条读取路径拿不到任何程序内容（design.md §6.4）。
+ * 失败的种类与原因留在 `detail` 里——它是状态而不是内容，job 状态行与 `cancel_program` 都要用。
  * @param result - PTC 的一次 run 结果。
- * @returns 模型可见的结果文本与结局分类。
+ * @returns 结局分类；正常完成时只有 `status`。
  */
-function renderOutcome(result: PtcRunResult): RunProgramOutcome {
-  const captured = result.logs.length === 0 ? '' : `程序输出：\n${result.logs.join('\n')}\n\n`
+function classifyOutcome(result: PtcRunResult): RunProgramOutcome {
   if (result.error !== undefined) {
-    const detail = `${result.error.kind}: ${result.error.message}`
-    return { output: `${captured}程序执行失败（${result.error.kind}）：${result.error.message}`, status: 'failed', detail }
+    return { status: 'failed', detail: `${result.error.kind}: ${result.error.message}` }
   }
-  return { output: `${captured}${renderValue(result.value)}`, status: 'completed' }
-}
-
-/**
- * 渲染程序的 `return` 值。值本来就是 lossless JSON（不是就被 PTC 判成 `invalid-output`），
- * 所以这里只做序列化。
- * @param value - PTC 交回的完成值；程序没有 `return` 时缺席。
- * @returns 模型可见的文本。
- */
-function renderValue(value: PtcJsonValue | undefined): string {
-  if (value === undefined) return '程序没有返回值。'
-  return `程序返回值：\n${JSON.stringify(value, null, 2)}`
+  return { status: 'completed' }
 }
 
 /**

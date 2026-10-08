@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { JobHooks, JobId, JobStart } from '@deepseek-ai/dsh-jobs'
+import type { JobHooks, JobId, JobSpec } from '@deepseek-ai/dsh-jobs'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { RunProgramOutcome, RunProgramRequest } from '../host/engine.ts'
@@ -17,7 +17,7 @@ import type { ProgramExecute, ProgramRequest } from '../host/job-runner.ts'
  * `@deepseek-ai/dsh-jobs` 与 `@deepseek-ai/dsh-session` 在纯 Node 下没有解析路径。
  */
 
-/** 一个只有 id 的发起者：job-runner 只用到 `Agent.id`（会话 id）与对象身份。 */
+/** 一个只有 id 的发起者：`start` 用它的 `Agent.id` 当 job owner，`cancel` 直接收 session id。 */
 function agent(id: string): Agent {
   return { id: id as unknown as SessionId } as unknown as Agent
 }
@@ -42,7 +42,7 @@ function inboxOwner(id: string): { owner: Agent; pending: string[] } {
 /** 一次被假注册表收下的提交。 */
 interface FakeSubmit {
   readonly id: JobId
-  readonly spec: JobStart
+  readonly spec: JobSpec
   readonly hooks: JobHooks
 }
 
@@ -64,10 +64,11 @@ function fakeHost(throwOn?: string) {
   const warnings: string[] = []
   const ctx = {
     jobs: {
-      start(spec: JobStart): JobId {
-        // 注册表契约：`start` 同步调用 `run()` 恰好一次，把返回值当作 hooks。
-        const hooks = spec.run()
+      start(spec: JobSpec): JobId {
+        // 注册表契约：id 先发，再同步调用 `run(handle)` 恰好一次，把返回值当作 hooks。
+        // 本插件按设计不往输出 ring 里写，所以这个 handle 是空实现。
         const id = `${spec.kind}-${String(submissions.length + 1)}` as unknown as JobId
+        const hooks = spec.run({ id, append() {}, updateProgress() {} })
         submissions.push({ id, spec, hooks })
         return id
       },
@@ -140,7 +141,7 @@ test('start 同步返回 job id，不等程序跑完', () => {
   const submission = host.submissions[0]
   assert.ok(submission !== undefined)
   assert.equal(submission.spec.kind, 'execution-engine')
-  assert.equal(submission.spec.owner, owner, 'the owner is the initiating agent itself')
+  assert.equal(submission.spec.owner, owner.id, 'the owner is the initiating session')
   assert.equal(submission.spec.label, 'return 1')
   // 程序已经跑起来了，但还没有结算——提交本身没有 await 它。
   assert.equal(control.pending.length, 1, 'the program must already be running')
@@ -181,7 +182,7 @@ test('取消等 done 结算，返回前仍然占着槽位', async () => {
   const owner = agent('owner-a')
 
   const id = programs.start(request(owner, 'return 1'))
-  const cancelled = programs.cancel(owner)
+  const cancelled = programs.cancel(owner.id)
   let returned = false
   void cancelled.then(() => { returned = true })
   await tick()
@@ -194,7 +195,7 @@ test('取消等 done 结算，返回前仍然占着槽位', async () => {
 
   // 执行入口按"取消后的收场"结算：abort 已发生，所以终态是 killed，detail 记的是取消原因，
   // 而不是程序在那一刻自己报的 abort 失败（那只是取消的影子）。
-  control.pending[0]?.({ output: '程序执行失败（abort）：cancelled', status: 'failed', detail: 'abort: cancelled' })
+  control.pending[0]?.({ status: 'failed', detail: 'abort: cancelled' })
   const result = await cancelled
 
   assert.equal(result.cancelled, true)
@@ -229,20 +230,20 @@ test('cancel 同步且幂等；没有程序在跑时 cancelled:false', async () 
   const programs = createProgramJobs(host.ctx, control.run)
   const owner = agent('owner-a')
 
-  assert.deepEqual(await programs.cancel(owner), { cancelled: false })
-  assert.deepEqual(await programs.cancel(agent('owner-b')), { cancelled: false })
+  assert.deepEqual(await programs.cancel(owner.id), { cancelled: false })
+  assert.deepEqual(await programs.cancel(agent('owner-b').id), { cancelled: false })
 
   const id = programs.start(request(owner, 'return 1'))
-  const firstCancel = programs.cancel(owner)
-  const secondCancel = programs.cancel(owner)
-  control.pending[0]?.({ output: '程序执行失败（abort）：cancelled', status: 'failed' })
+  const firstCancel = programs.cancel(owner.id)
+  const secondCancel = programs.cancel(owner.id)
+  control.pending[0]?.({ status: 'failed' })
   const [first, second] = await Promise.all([firstCancel, secondCancel])
 
   assert.equal(first.cancelled, true)
   assert.equal(second.cancelled, true, 'a second cancel of the same live program is harmless')
   assert.equal(String(first.jobId), String(id))
   // 已经结算之后再取消：明确的"当前没有正在运行的程序"，不是错误（design.md §4.4）。
-  assert.deepEqual(await programs.cancel(owner), { cancelled: false })
+  assert.deepEqual(await programs.cancel(owner.id), { cancelled: false })
 })
 
 test('取消打到本次提交自己的信号上，与调用方的信号无关', async () => {
@@ -255,9 +256,9 @@ test('取消打到本次提交自己的信号上，与调用方的信号无关',
   const signal = control.signals[0]
   assert.ok(signal !== undefined)
   assert.equal(signal.aborted, false)
-  const cancelled = programs.cancel(owner)
+  const cancelled = programs.cancel(owner.id)
   assert.equal(signal.aborted, true, 'cancel must abort the signal this submission handed to the program')
-  control.pending[0]?.({ output: 'cancelled', status: 'failed' })
+  control.pending[0]?.({ status: 'failed' })
   await cancelled
 })
 
@@ -288,7 +289,7 @@ test('插件 dispose 先取消在跑的程序、等它结算，再清记账', as
     '结算之前记账不能被释放',
   )
 
-  control.pending[0]?.({ output: 'done', status: 'completed' })
+  control.pending[0]?.({ status: 'completed' })
   await unwatched
 
   assert.doesNotThrow(
@@ -318,8 +319,8 @@ test('取消结算时作废仍未投递的 report', async () => {
   deliverReports(control, owner)
   assert.equal(owner.pending.length, 2)
 
-  const cancelled = programs.cancel(owner.owner)
-  control.pending[0]?.({ output: '程序执行失败（abort）：cancelled', status: 'failed' })
+  const cancelled = programs.cancel(owner.owner.id)
+  control.pending[0]?.({ status: 'failed' })
   await cancelled
 
   // design.md §4.4：程序死了，它没来得及说的话就别说了。取消返回的那一刻队列里就该空了。
@@ -354,8 +355,8 @@ test('作废本身抛（收件箱投影已注销）时收住：flow/end 照发�
   assert.ok(reports !== undefined, 'the producer must hand the run its report ledger')
   reports.record('report-0' as unknown as MessageId, 'one')
 
-  const cancelled = programs.cancel(owner)
-  control.pending[0]?.({ output: 'cancelled', status: 'failed' })
+  const cancelled = programs.cancel(owner.id)
+  control.pending[0]?.({ status: 'failed' })
   await cancelled
   const submission = host.submissions[0]
   assert.ok(submission !== undefined)
@@ -381,7 +382,7 @@ test('正常结算不作废仍未投递的 report', async () => {
   programs.start(request(owner.owner, 'return 1'))
   deliverReports(control, owner)
 
-  control.pending[0]?.({ output: 'done', status: 'completed' })
+  control.pending[0]?.({ status: 'completed' })
   const submission = host.submissions[0]
   assert.ok(submission !== undefined)
   await submission.hooks.done
@@ -410,7 +411,7 @@ test('flow/* 事件：启动、report、结束都以 run 身份关联', async ()
     [{ runId: id, text: 'one' }, { runId: id, text: 'two' }],
   )
 
-  control.pending[0]?.({ output: 'done', status: 'completed', detail: 'exit code: 3' })
+  control.pending[0]?.({ status: 'completed', detail: 'exit code: 3' })
   const submission = host.submissions[0]
   assert.ok(submission !== undefined)
   await submission.hooks.done
@@ -490,8 +491,8 @@ test('run 终止时给未闭合的调用补发合成的 call-end，且在 flow/e
   trace.end({ callId: 0, member: 'process', line: 2, ms: 5, outcome: 'ok', result: 'null', resultTruncated: false })
   trace.start({ callId: 1, member: 'report', line: 3, args: '["x"]', argsTruncated: false })
 
-  const cancelled = programs.cancel(owner)
-  control.pending[0]?.({ output: '程序执行失败（abort）：cancelled', status: 'failed' })
+  const cancelled = programs.cancel(owner.id)
+  control.pending[0]?.({ status: 'failed' })
   await cancelled
   const submission = host.submissions[0]
   assert.ok(submission !== undefined)
@@ -541,7 +542,7 @@ test('程序正常跑完但留下未闭合的调用时，同样补发合成 end'
   // 起了但没 await：程序带着一个在飞的调用返回。
   trace.start({ callId: 0, member: 'process', line: 1, args: '[["python"]]', argsTruncated: false })
 
-  control.pending[0]?.({ output: 'done', status: 'completed' })
+  control.pending[0]?.({ status: 'completed' })
   const submission = host.submissions[0]
   assert.ok(submission !== undefined)
   await submission.hooks.done

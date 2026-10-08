@@ -101,11 +101,14 @@ declare function readTextFile(path: string): Promise<string>
 declare function writeTextFile(path: string, text: string): Promise<void>
 declare function exists(path: string): Promise<boolean>
 declare function fetch(input: string, init?: object): Promise<Response>
-declare const console: { log(...): void; info(...): void; warn(...): void; error(...): void; debug(...): void }
 ```
 
 这份声明的**事实来源是 `host/sdk.ts`**（`sdkText`），它进系统提示的 `execution-engine-sdk` 段，
 两个超时数字是插进去的已解析值。程序里**没有** `process`、`require`、动态 `import`、`child_process`。
+
+**程序的结果不回主 agent**：`return` 的值不进 job 注册表，所以通用的 `job_output` 读不到任何程序正文
+——`report` 是唯一的内容通道（design.md §6.4 的字面实现）。失败以 job 的终态与 `detail` 呈现
+（状态行与 `cancel_program` 都用它），那是状态而不是内容。程序里也**没有 `console`**：控制台打点无处可去。
 
 **没有 `import` 是明确接受的取舍**：能力面可枚举（可写进 `.d.ts`）换来的是程序不能 import 库或项目文件。
 要一个值就在程序里用 TypeScript 算；值确实在外部脚本里就走 design.md §3.4 的取值约定——脚本写文件、程序读文件。
@@ -177,6 +180,16 @@ const plain = await dispatchsubagent('and summarize this')   // 沿用当前会�
 
 ## 验证
 
+### 阶段 9 的改动：本节的实测输出都早于它
+
+阶段 9 适配 DSH 0.2.1，并同时改了交付面（程序正文不再回主 agent）。**下面记录的每一次实测都跑在这次改动之前的树上**，判据本身不变，数字要重跑：
+
+- A 档：`pnpm run typecheck`（host 面覆盖 `tests/**`，所以 B 档驱动的类型错误也在这里爆）、`pnpm run test`、`pnpm run build`、`node --check lib/client.js`。
+- B 档两份 fixture：判据见下表，只多一条——**程序结果一律由程序自己 `report` 取**，驱动不再从 job 输出里读（`job_output` 现在什么正文都读不到）。
+- C 档与 GIF：client face 的 references 已改引 leaf，所以"面板能否编译"重新变成已知项；**能不能渲染仍然只有浏览器实测说了算**。
+
+改动清单：job owner 从 `Agent` 换成会话 id、`cancel` 收成 session id、report 的 `source.kind` 自报为 `execution-engine`（不再有兜底的 `plugin`）、`runProgram` 只归类结局不再渲染程序正文、client face 的两条 references 改引 `tsconfig.client.json` 叶子。
+
 ### A 档（纯 Node / tsc，不需要 tsx；本会话已跑，输出见下方）
 
 ```powershell
@@ -233,7 +246,7 @@ node --import tsx/esm Workspace/ExecutionEngine/tests/loader-driver.ts Workspace
 | B7 | 单例拒绝（错误里带 A 的 job id）；取消后立刻能起 B，且取消返回时 A 的临时目录已消失 |
 | B9 | 取消**返回的那一刻** fork 出的父/子进程都已消失、临时目录已删，3s 后本该出现的哨兵文件始终没出现 |
 | B10 | dispose 发起 agent 的 scope → job 被取消、清理完成、注册表里的记录已删 |
-| B11 / B12 | `report` 按程序调用顺序投递、`source.plugin === 'execution-engine'`；取消后本次 run 未投递的三条被摘掉（`flow/end.discarded === 3`），上一次 run 留下的两条原封不动 |
+| B11 / B12 | `report` 按程序调用顺序投递、`source.kind === 'execution-engine'`（阶段 9 起不再有兜底的 `plugin` kind）；取消后本次 run 未投递的三条被摘掉（`flow/end.discarded === 3`），上一次 run 留下的两条原封不动；程序结果一律由程序自己 `report`，驱动不再从 job 输出里读 |
 | B13 | `flow/call-start.line` 逐条等于程序里写死的行号（含循环里重复的同一行、失败调用也闭合）、`flow/start.code` 是提交正文，而内部 `trace` 不在程序可见面里 |
 | B14a / B14b | 两条 route 真的挂在 `ctx.connection.fetch` 上（含缺 `sessionId`、负 `since` 的 400）；面板状态与 `flow/*` 逐条一致、`since` 增量三种取值、经路由取消且返回时临时目录已删 |
 | B15（阶段 8） | 命中 `allowedModels` 的 route **逐字**到脚本化 provider 的 `agentOptions`；不填时请求里没有这个键（继承语义没变）；清单外的 route 抛出且消息里列出可用 route；只给 `model` 抛出且消息里含与 `list_subagent_models` 同一句 `` `model` requires `provider` `` |
@@ -297,9 +310,15 @@ pnpm dsh web --patch Workspace/ExecutionEngine/execution-engine.cordis.yml --hos
 - **`report` 每条一次模型调用**，额度不由引擎管——报什么、报几次由程序自己掌握（攒到阶段边界再报是程序该有的纪律）。
 - **没有续跑**：取消 + 重启 = 全量重跑，取消带走程序全部状态，**已发生的副作用会重来**（`notify.py` 会再发一封邮件）。
 - **不给程序清理机会**：主 agent 消失时程序被静默硬杀，副作用可能残缺（半个文件、半封邮件）。
-- **`tool-jobs` 在默认部署下会额外唤醒一次**：标准 preset 挂着 `@deepseek-ai/dsh-tool-jobs`，它会给 owner 投递 job
-  完成通知、也会把 `job_output` / `job_list` / `job_kill` 暴露给模型。所以「主 agent 只能启动 / 取消 / 看 report」是
-  **设计意图，不是默认部署下的事实**；`completionDelivery: 'quiet'` 可关掉唤醒（纯配置）。本插件从生产方一侧抑制不了。
+- **`tool-jobs` 在默认部署下仍会额外唤醒一次**：标准 preset 挂着 `@deepseek-ai/dsh-tool-jobs`，它会给 owner 投递
+  job 完成通知、也会把 `job_output` / `job_list` / `job_kill` 暴露给模型。这三件事里**只有"内容"那一半由本插件守住了**：
+  `JobOutcome` 不填 `result`，`job_output` 因此读不到任何程序正文（阶段 9 的裁决）。剩下的是"知道"——job 的存在、
+  终态与那条完成通知；`completionDelivery: 'quiet'` 可关掉唤醒（纯配置），本插件从生产方一侧抑制不了。
+- **程序的 `return` 值与 `console` 都不再交付给任何人**：阶段 9 起 `runProgram` 只归类结局，不再渲染程序正文
+  （原来它整段进 `JobOutcome.output`，主 agent 用 `job_output` 就能读走）。同一阶段把 `console` 从程序的能力面里
+  去掉——它是 PTC 注入的形参，之前只是被透传成 vm 全局；既然输出没有消费者，留着就是一个"看起来有用、实际没有
+  后果"的 API。代价是"跑完顺手看一眼返回值"与"随手打点"两条路径都没有了，程序要让人看到什么必须 `report`
+  （或 `writeTextFile` 写到工作目录）；失败原因仍经 `detail` 到达状态行与 `cancel_program`。
 - **Windows fallback owner 下 `waitForExit` 只保证直接子进程**：provider 自己的文档承认逃出去的子孙不保证被终止。
   准确的承诺是"等 provider 能观察到的受管范围静默"，不是"整棵树都没了"。
 - **插件卸载会取消在跑的程序**（design.md §4.4 的取消入口之一），所以卸载/重载期间的程序是做不到"跑完再说"的。
@@ -314,7 +333,7 @@ pnpm dsh web --patch Workspace/ExecutionEngine/execution-engine.cordis.yml --hos
 | 面 | 导出 | 约束 |
 |---|---|---|
 | host 插件 | 恰好 `name` / `inject` / `Config` / `apply`，**没有 `default`** | Loader 的 `unwrapExports` 会取 `.default`，加了它会把 `inject` / `name` / `Config` 一起丢掉（postmortem 0001）。`tests/host-shape.spec.ts` 钉住这条 |
-| host `inject` | `['tools','jobs','ptcRuntime','subprocess','subagents','sandbox','systemPrompt']` | `sandboxPolicy`、`agents` 与 `subagentModelSelection` 走 `ctx.get` 可选读；`connection` 走 `ctx.inject(['connection'], …)`，所以 headless 部署照样能跑程序 |
+| host `inject` | `['tools','jobs','ptcRuntime','subprocess','subagents','sandbox','systemPrompt']` | `sandboxPolicy` 与 `subagentModelSelection` 走 `ctx.get` 可选读；`connection` 走 `ctx.inject(['connection'], …)`，所以 headless 部署照样能跑程序 |
 | client 插件 | `apply` / `inject`（`['slots','locale']`） | 业务组件、locale 字典、源实现都不导出；`build/build-client.mjs` 的模块表 id 必须等于包名 |
 
 ## 回归测试覆盖（§13 第 5 条的审计结论）
@@ -347,7 +366,7 @@ pnpm dsh web --patch Workspace/ExecutionEngine/execution-engine.cordis.yml --hos
 | 面 | 现状 |
 |---|---|
 | `host/index.ts` 的 `authorityOf` 找不到工作目录时抛 | **哪一档都没有**：它要求"会话没有 cwd 且没有 sandboxPolicy"，在真装配里造不出来（fixture 的会话总是带 cwd），纯 Node 又加载不了 `host/index.ts`（运行时要 `@deepseek-ai/schemastery`） |
-| `host/engine.ts` 的 `renderValue` "程序没有返回值"分支 | **哪一档都没有**。`return` 一个 `undefined` 的程序会走到它（`ptc-runtime-node` 的 `prepareCompletion(undefined)` 返回 `{}`，不是 `invalid-output`），但 `host/engine.ts` 运行时要 `@deepseek-ai/dsh-llm`，纯 Node 加载不了，所以只能由 B 档补：`const b = await runToCompletion("await process(['python','-c','print(1)'])"); assert.ok(b.endsWith('程序没有返回值。'))` |
+| `host/engine.ts` 的 `classifyOutcome` 两个分支 | **阶段 9 改写**：原来的 `renderValue`（"程序没有返回值"那条）随程序正文一起删除，缺口消失。成功分支由任何跑完的 B 档用例覆盖；失败分支由程序抛错 / `processOrThrow` 那几条经 job 的 `detail` 覆盖 |
 | `host/engine.ts` 的 `readTraceRecord` 拒绝畸形记录 | **哪一档都没有**：外壳自己发的记录永远合法，这是 wire 边界的防御分支 |
 | `host/tool.ts` 的两个 render | B 档间接覆盖：`startProgram` 断言返回文本里带 job id（`程序已在后台运行（…）`），B8 断言 `当前没有正在运行的程序`；`cancelled: true` 那条渲染文本没有断言 |
 | `host/process-binding.ts` | B 档：B1–B5（真进程）；B2b 覆盖 `exited with code`。**A 档明确不写**：纯 Node 里跑真进程会与并发、端口、进程组纠缠（phase1-plan §11） |
@@ -441,8 +460,8 @@ discipline 第 3 条禁止 feature plugin 之间 runtime value import——拆�
    没有的包要进允许清单）。本文是中文单语，迁进 `packages/` 后按 [docs/AGENTS.md](../../docs/AGENTS.md) 的双语规则拆成
    `README.md` + `README.zh.md` + `README.i18n.yaml`。
 9. **覆盖率** —— `pnpm run test:coverage` 是**逐文件 100%**（`packages/*/*/src`）。当前缺口（按文件列）：
-   `src/index.ts`（`authorityOf` 的抛错分支）、`src/engine.ts`（`renderValue` 的无返回值分支、`readTraceRecord` 的拒绝分支、
-   `renderOutcome` 两条）、`src/tool.ts`（两条 render、schema）、`src/process-binding.ts`（大部分）、
+   `src/index.ts`（`authorityOf` 的抛错分支）、`src/engine.ts`（`classifyOutcome` 的失败分支、`readTraceRecord` 的拒绝分支）、
+   `src/tool.ts`（两条 render、schema）、`src/process-binding.ts`（大部分）、
    `src/client/*`（面板与轮询源）。补法只有两条：写 spec（`process-binding` 与 `engine` 的运行时依赖要 mock 或用 v8 ignore 之外
    的真实装配），或者给**真的不可达**的分支写 `/* v8 ignore -- <理由> */`（仓库禁止裸 ignore）。
 10. **新受管的门** —— 迁移后这些门会开始管这里：`verify-export-jsdoc`（每个导出要有 JSDoc，含 `@param`/`@returns`）、

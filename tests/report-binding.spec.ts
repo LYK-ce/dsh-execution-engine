@@ -101,7 +101,7 @@ function harness(aborted = false) {
   return { owner, ledger, factory, received, controller, report }
 }
 
-test('report 造出的消息带 plugin/notice 的 source，摘要来自注入的截断助手', async () => {
+test('report 造出的消息带 execution-engine/notice 的 source，摘要来自注入的截断助手', async () => {
   const h = harness()
 
   assert.equal(await h.report({ text: '阶段 3 完成' }), null)
@@ -109,8 +109,7 @@ test('report 造出的消息带 plugin/notice 的 source，摘要来自注入的
   assert.deepEqual(h.factory.inputs, [{
     content: [{ type: 'text', text: '阶段 3 完成' }],
     source: {
-      kind: 'plugin',
-      plugin: REPORT_PLUGIN,
+      kind: 'execution-engine',
       form: 'notice',
       // 整段正文进截断助手，出来的是摘要——不是把正文直接塞进 summary。
       summary: 'summary:阶段 3 完成',
