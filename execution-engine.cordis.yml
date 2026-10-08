@@ -10,6 +10,11 @@
 # 用法（源码启动的 dsh，host 半边直接跑 .ts）：
 #   pnpm dsh web --patch Workspace/ExecutionEngine/execution-engine.cordis.yml
 #
+# 这个文件同时是 package.json 的 `dsh.bundle.patch` 目标，所以
+#   pnpm dsh plugin --profile <profile> add <spec>
+# 也展开同一行。两条路线插的行 id 相同（execution-engine-host），而 --patch 最后应用——
+# 同时用两者时跑的是被 --patch 指到的那一份，bundle 那份静默不生效（见 README「已知限制」）。
+#
 # 前置条件：先在本目录 pnpm install && pnpm run build。@deepseek-ai/dsh-client-modules
 # 按行名读到本包的 dsh.client 后会立刻读 lib/client.js，缺了它整个 dsh web 启动失败。
 - insert:

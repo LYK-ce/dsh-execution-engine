@@ -3,3 +3,7 @@
 # 而这个沙箱禁止带管道的子进程，跑它会 EPERM。所以这里显式关掉构建脚本。
 allowBuilds:
   esbuild: false
+# 声明 peer 是为了让 profile 的运行时解析器把它们路由到 dsh installation 的那一份
+# （profile 自己那份 pnpm-workspace.yaml 由 dsh 写成 nodeLinker: hoisted + autoInstallPeers: false）。
+# 本目录若自动装 peer，只会多出第二份 cordis / schemastery，并让构建路径重新依赖网络。
+autoInstallPeers: false

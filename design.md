@@ -437,7 +437,8 @@ interface ProcessOutput {
 
 ## 12. 实施计划
 
-**本目录是独立的 git 仓库**（`Workspace/ExecutionEngine/`）。每完成一个阶段提交一次；没有配置远程仓库，只提交本地。
+**本目录是独立的 git 仓库**（`Workspace/ExecutionEngine/`，remote `https://github.com/LYK-ce/dsh-execution-engine`，分支 `master`）。
+每完成一个阶段提交一次并 push——**git 装法拉的是远端**，改动必须先 push 才装得到。
 
 三条原则：
 
@@ -632,7 +633,7 @@ interface ProcessOutput {
   `{ provider, model }` 的调用被拒且清单是 `(none)`；在设置里打开并加一条 route 之后同一段程序跑通——这是
   "引擎读得到**真部署**的策略"唯一看得见的形态（B15 用的是 fixture 自己挂的同名服务）。
 - **仓库级 keyless 快照仍未产出（迁移欠账）**：`snapshots/AGENTS.md` 要求每个被测进程经 `dsh` CLI + 一个
-  shipped profile 启动，而本插件今天是 `--patch` overlay、不在任何 shipped profile 里。本阶段用插件自己的
+  shipped profile 启动，而用户虽然能把它装成 profile bundle，它却仍**不是随产品出货的 shipped profile**。本阶段用插件自己的
   golden 断言（`tests/sdk-text.spec.ts`）把 `.d.ts` 渲染文本逐字钉住；仓库那一份随迁移补。**
 
 ### 阶段 9 — 适配 DSH 0.2.1，并把程序正文从交付面去掉

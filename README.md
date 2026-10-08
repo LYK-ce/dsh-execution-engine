@@ -7,8 +7,9 @@
 设计依据 [design.md](./design.md)；实施是阶段 0–8，每个阶段的方案与当时跑过的证据在
 [phase0-plan.md](./phase0-plan.md) … [phase8-plan.md](./phase8-plan.md)。文档风格照 [../Blackboard/README.md](../Blackboard/README.md)。
 
-本目录是**独立的 git 仓库**，不是仓库根 workspace 的一部分：它自带 `pnpm-workspace.yaml`（自己就是 workspace root），
-host 半边靠 `--patch` overlay 挂上，客户端 bundle 由 `build/build-client.mjs` 自己打包。**没有改 `packages/` 的任何文件。**
+本目录是**独立的 git 仓库**（remote `https://github.com/LYK-ce/dsh-execution-engine`，分支 `master`），不是仓库根 workspace 的一部分：
+它自带 `pnpm-workspace.yaml`（自己就是 workspace root），既能按 `dsh.bundle.patch` 装成 profile bundle，也能继续用 `--patch` overlay 挂上，
+客户端 bundle 由 `build/build-client.mjs` 自己打包。**没有改 `packages/` 的任何文件。**
 
 ## 目录
 
@@ -34,15 +35,46 @@ client/          浏览器半边，被打包成 lib/client.js
   index.tsx      slots 注册 + locale + 轮询源 + 取消请求
   panel.tsx      conversation.view 面板：状态行、源码（行号/当前行/开窗）、轨迹、汇报、取消按钮
   locale.ts      en / zh 字典
-shared/          protocol.ts：两条路由的路径常量与线格式（两侧共用，无 @deepseek-ai/* import）
-build/           build-client.mjs：esbuild → lib/client.js（模块表 lazy-CJS 协议）
-tests/           12 个 node:test spec + loader-driver.ts（B 档驱动）+ fixtures/（两个 Loader 组合 + 脚本化 provider）
-execution-engine.cordis.yml  --patch overlay（只插一条 host 行）
-tsconfig.json / tsconfig.client.json   host / client 两个 noEmit program
-lib/             构建产物（本目录 .gitignore 覆盖）
+shared/          protocol.ts：两条路由的路径常量与线格式（两侧共用，无 @deepseek-ai/* import）。**必须进 `files`**：
+                 host/index.ts 与 host/routes.ts 对它是值导入，缺了这一行加载失败
+build/           build-client.mjs：esbuild → lib/client.js（模块表 lazy-CJS 协议）。**不进安装副本**
+tests/           12 个 node:test spec + loader-driver.ts（B 档驱动）+ fixtures/（两个 Loader 组合 + 脚本化 provider）。**不进安装副本**
+execution-engine.cordis.yml  `--patch` overlay（只插一条 host 行）**兼 `dsh.bundle.patch` 的目标**
+tsconfig.json / tsconfig.client.json   host / client 两个 noEmit program。**不进安装副本**
+lib/             `lib/client.js` 已进版本库（交付产物），其余忽略
 ```
 
 ## 安装与挂载
+
+**日常走 bundle 安装**：`package.json` 的 `dsh.bundle.patch` 指着 `execution-engine.cordis.yml`，所以 GUI 的插件管理器与
+`dsh plugin` 都能把它装进一个 profile：
+
+```powershell
+# cwd = 仓库根
+pnpm dsh plugin --profile <profile> add <spec>
+```
+
+| `<spec>` | 形态 | 什么时候用 |
+|---|---|---|
+| `C:\...\Workspace\ExecutionEngine` | `link:`，直接链工作树 | 本机迭代 |
+| `git+https://github.com/LYK-ce/dsh-execution-engine` | git 装法，吃**远端**已 push 的提交 | 装推上去的版本 |
+| `dsh-execution-engine`（npm） | 还没发布 | — |
+
+**GUI 里必须填绝对路径**：CLI 会把相对路径按当前工作目录锚定，而 GUI 没有"当前目录"这回事。
+装完 `dsh` 会把它写进 profile 的 `dependencies` 与 `dsh.profile.bundles`（如 `["@deepseek-ai/dsh-base", "dsh-execution-engine"]`），
+加载时按 bundle 声明的 `patch` 展开那条 host 行。依赖段里这五个 `@deepseek-ai/*` 写在 **`peerDependencies`**：profile 安装是
+`nodeLinker: hoisted` + 不自动装 peer，peer 才会被路由到 dsh installation 的那一份；写成 `dependencies` 会被平铺进 profile 并**遮蔽**它。
+
+**源码开发才用 `--patch`**：只改 host 半边时不必重装，叠一层 overlay 最省事：
+
+```powershell
+# cwd = 仓库根
+pnpm dsh web --patch Workspace/ExecutionEngine/execution-engine.cordis.yml
+```
+
+**两条路线都要求 `lib/client.js` 就位**：overlay/ bundle 都只插一条 host 行，而 `@deepseek-ai/dsh-client-modules` 按这条行的
+**行名**找到最近的 `package.json`，读到 `dsh.client` 之后会**立刻**去读 `exports["./client"]` 指的 `lib/client.js`；缺了它整个
+`dsh web` 启动失败（modules 是 required 行），不是"面板不出现"这么轻。本地路径装法（`link:`）直接吃工作树，所以那种装法要先
 
 ```powershell
 cd Workspace\ExecutionEngine
@@ -50,17 +82,11 @@ pnpm install
 pnpm run build
 ```
 
-```powershell
-# cwd = 仓库根
-pnpm dsh web --patch Workspace/ExecutionEngine/execution-engine.cordis.yml
-```
+git / npm 装法吃的是提交 / tarball 里的产物（`lib/client.js` 已进版本库），装的人不需要构建。改成客户端代码之后同样要重新 build
+再刷新页面，**没有 HMR**。
 
-**为什么必须先 `pnpm run build`**：overlay 只有一条行，`@deepseek-ai/dsh-client-modules` 按这一行的**行名**找到最近的
-`package.json`，读到 `dsh.client`（`package.json` 的 `dsh.client.platform`）之后会**立刻**去读
-`exports["./client"]` 指的 `lib/client.js`；缺了它整个 `dsh web` 启动失败（modules 是 required 行），
-不是"面板不出现"这么轻。改成客户端代码之后同样要重新 build 再刷新页面，**没有 HMR**。
-
-host 半边不需要构建：`dsh` 是源码启动（`node --import tsx/esm apps/cli/src/bin.ts`），overlay 的行名直接指 `./host/index.ts`。
+host 半边在这一层不需要构建：`dsh` 是源码启动（`node --import tsx/esm apps/cli/src/bin.ts`），行名直接指 `./host/index.ts`。
+**但这条只在源码启动下成立**——打包版 `dsh` 加载不了 `.ts` 行，见「已知限制」。
 
 ## 命令
 
@@ -198,11 +224,14 @@ pnpm run typecheck
 pnpm run test
 pnpm run build
 node --check lib/client.js
-# 阶段 6 附加：bundle 里必须有模块 id 与 locale 键（lib/ 不进 git，所以要当场验）
+# 阶段 6 附加：bundle 里必须有模块 id 与 locale 键
 Select-String -Path lib\client.js -Pattern 'dsh-execution-engine','view.panel','action.cancel'
 ```
 
 判据：前四条 exit 0，`pnpm run test` 全绿（当前 104 条），最后一条三个模式都命中。
+
+**纪律**：`lib/client.js` 虽然已进版本库，但它**不会自己更新**——改了 `client/` 必须重跑 `pnpm run build` 并把
+`lib/client.js` 一起提交，否则装到的人拿到的是陈旧面板。本地路径装法直接吃工作树，会把这个问题掩盖掉；git 装法吃的是提交里的那一份。
 
 **本会话的 A 档真实输出**（阶段 8 执行时）：
 
@@ -302,7 +331,25 @@ pnpm dsh web --patch Workspace/ExecutionEngine/execution-engine.cordis.yml --hos
 
 ## 已知限制
 
-- **仓库级 keyless 快照没产出（迁移欠账）**：`snapshots/AGENTS.md` 要求每个被测进程经 `dsh` CLI + 一个 shipped profile（+ 可选 scenario patch）启动，而本插件今天是 `--patch` overlay、不在任何 shipped profile 里，录制还要 key、产物要落 `snapshots/`——都在本插件的改动范围之外。本插件因此用**自己的 golden 断言**（`tests/sdk-text.spec.ts` 把 `.d.ts` 渲染文本逐字钉住）顶上，模型可见的三处（两个工具的 schema 与结果文本、`execution-engine-sdk` 段）都还没有仓库级录制会话。这一笔随**迁移**还：迁移后插件进了 shipped profile，那一次 PR 才录得出来（见「搬进 `packages/` 时要做什么」第 11 条）。
+- **仓库级 keyless 快照没产出（迁移欠账）**：`snapshots/AGENTS.md` 要求每个被测进程经 `dsh` CLI + 一个 shipped profile（+ 可选 scenario patch）启动，而用户虽然能把它装成 profile bundle，它却仍**不是随产品出货的 shipped profile**（`packages/bundle/web-app` 里没有它），录制还要 key、产物要落 `snapshots/`——都在本插件的改动范围之外。本插件因此用**自己的 golden 断言**（`tests/sdk-text.spec.ts` 把 `.d.ts` 渲染文本逐字钉住）顶上，模型可见的三处（两个工具的 schema 与结果文本、`execution-engine-sdk` 段）都还没有仓库级录制会话。这一笔随**迁移**还：迁移后插件进了 shipped profile，那一次 PR 才录得出来（见「搬进 `packages/` 时要做什么」第 11 条）。
+- **profile 安装副本里的 host 行只在源码启动的 `dsh` 下加载得起来**：那条行是 `./host/index.ts`。它能被加载**只在 `dsh web`
+  以 `node --import tsx/esm apps/cli/src/bin.ts` 源码启动时**成立——Node 的**内建类型剥离拒绝 `node_modules` 下的 `.ts`**
+  （`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`），而 profile 的安装副本就在 `node_modules/` 下。所以**打包 / 发布版 `dsh`
+  （纯 node 启动、没有 tsx）加载不了 profile 安装副本里的 host 行**：这条行 import 失败后**没有 fiber**
+  （`vendor/loader/src/config/entry.ts`），而 `@deepseek-ai/dsh-client-modules` 会跳过没有 fiber 的行
+  （`packages/client/modules/src/index.ts`）——于是 **host 与客户端半边一起消失**：`run_program` / `cancel_program` 不注册、
+  两条 route 不注册、**面板也不会被 serve**，整个插件在 GUI 里不存在，只在启动期留下一条 `warning: … failed to import`
+  （这行不在 `requiredStartupEntryIds` 里，所以不致命）。要支持打包版，后续得把 host 半边也打成 `lib/host.js` 并把行名指过去，
+  那是另一次改动。**注意**：这与"`lib/client.js` 缺失"是两种不同的失败——后者在构造期抛 `MissingClientBundleError` 而
+  `modules` 是 required 行，**整个 `dsh web` 起不来**。
+- **bundle patch 与 `--patch` 插的是同一个行 id `execution-engine-host`**，而 `--patch` 层最后应用、后者胜 → **装了 bundle
+  却仍带 `--patch` 启动时，跑的是工作树那一份、bundle 静默不生效**（两份代码不一致时尤其难查）。自查：
+
+  ```powershell
+  pnpm dsh --profile web --dump-config | Select-String 'execution-engine-host'
+  ```
+
+  出现两行即双挂载（实测 `--profile eetest --dump-config --patch …` 会打印两条：先 bundle 那份、后 `--patch` 那份）。
 - **显式指定子 agent 模型是部署能力，不是程序能力**：`allowedModels` 由用户设置维护、服务由 web-app bundle 挂。策略缺席、没开启或清单为空时，程序的 `dispatchsubagent(p, { provider, model })` 一律被拒（消息里 `available routes: (none)`）——引擎**没有**"没有策略就放行"的回落，那会把"部署授权"重新变成"调用方自己说了算"。
 - **`assertAllowedRoute` 把"缺席 / 未开启 / 空清单"归一成同一个空清单是故意的**：三者在引擎这一侧的后果完全相同——没有授权任何可选路由，拒绝消息一律是 `available routes: (none)`。其中 `enabled && allowedModels.length === 0` 这一路在**生产里不可达**：`subagent-model-selection-settings` 在加载与写入两侧都拒这种取值（`packages/subagent/tool-subagent/src/model-selection-settings.ts:92-97`）。保留它是因为引擎读的是 `ctx.get('subagentModelSelection')` 拿到的实现，不代上游断言"这条不会出现"。
 - **面板不可回放。** 数据走宿主侧累加器 + 轮询，不是会话事件：刷新页面要等下一拍（最多 1s）才恢复，而且看不到历史 run
@@ -481,8 +528,8 @@ discipline 第 3 条禁止 feature plugin 之间 runtime value import——拆�
 - **覆盖率从"90 条 spec 覆盖到哪里算哪里"变成逐文件 100%**：`src/client/*` 与 `src/engine.ts` 是两块硬骨头，
   面板要浏览器环境（jsdom pragma）或者把折行/开窗/当前行那几条纯函数抽出来单测；`engine.ts` 要在真装配下测。
 - **客户端 bundle 的同进同出**：`dsh.client` 声明了就必须有 `lib/client.js`，而迁移把打包器整个换掉（自建 esbuild → 仓库
-  `clientBundle`），模块表 id、banner/footer、external 规则全部改由 preset 决定；`lib/` 不进 git，所以"本地能跑、干净树不能跑"
-  这类问题只在别人 checkout 时才暴露。
+  `clientBundle`），模块表 id、banner/footer、external 规则全部改由 preset 决定；`lib/client.js` 现在进了 git，但**它不会自己更新**——
+  "改了 `client/` 忘了重跑 build 就提交"这一类问题只在别人 git 装的时候才暴露（本地路径装法吃工作树，会把它掩盖掉）。
 - **测试 runner 与路径的连带改动**：`node:test` → vitest、`tests/loader-driver.ts` 里写死的相对路径与 fixture 行名、
   以及 `overlay.spec.ts` 这类"为绕开仓库门而存在"的 spec，全都是迁移当次必须一起改的东西，改漏一条就是在别人的 CI 上红。
 - 次要但会咬人的：`flow.tmpDir` 的 `<会话工作目录>/.execution-engine/` 在迁移后仍会落在被测/被用的工作目录里，

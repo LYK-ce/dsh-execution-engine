@@ -1,4 +1,8 @@
 node_modules/
-lib/
+# lib/client.js 是交付产物：dsh.client 一声明，@deepseek-ai/dsh-client-modules 启动时
+# 就 readFileSync exports["./client"]，缺了整个 dsh web 起不来（不是"面板不出现"）。
+# 本包刻意不放 prepare（git 装法不跑构建），所以产物必须进版本库；其余构建残渣仍然忽略。
+lib/*
+!lib/client.js
 # run 临时目录（design.md §3.5）：建在会话工作目录下，硬崩溃时可能残留。
 .execution-engine/

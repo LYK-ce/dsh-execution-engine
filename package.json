@@ -1,7 +1,8 @@
 {
   "name": "dsh-execution-engine",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "description": "把长任务的中段执行变成一段程序：后台跑 TypeScript 程序，派子 agent、跑外部进程、单向汇报回发起会话，并带一个可观察的 GUI 面板。",
   "type": "module",
   "exports": {
     "./client": "./lib/client.js",
@@ -10,20 +11,29 @@
   "dsh": {
     "client": {
       "platform": "web"
+    },
+    "bundle": {
+      "patch": "./execution-engine.cordis.yml"
     }
   },
   "files": [
     "execution-engine.cordis.yml",
-    "build",
-    "client",
     "host",
-    "lib",
-    "tests"
+    "shared",
+    "client",
+    "lib"
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.client.json",
     "build": "node build/build-client.mjs",
     "test": "node --test --test-isolation=none \"tests/*.spec.ts\""
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.5-alpha.1",
+    "@deepseek-ai/dsh-llm": "^0.2.1-alpha.1",
+    "@deepseek-ai/dsh-subprocess": "^0.2.1-alpha.1",
+    "@deepseek-ai/dsh-tools": "^0.2.1-alpha.1",
+    "@deepseek-ai/schemastery": "^3.18.5-alpha.1"
   },
   "devDependencies": {
     "@types/react": "18.3.31",
